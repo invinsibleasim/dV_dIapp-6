@@ -197,3 +197,302 @@ uploaded = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
 time_col_default = "time_s"
 v_col_default = "V_V"
+i_col_default = "I_A"
+
+# Derivative controls
+st.sidebar.subheader("Derivative Estimation")
+method = st.sidebar.selectbox("Method", ["Local linear (recommended)", "Gradient"], index=0,
+                              help="Local linear fit in a time window is robust to noise and irregular sampling.")
+window_sec = st.sidebar.number_input("Local linear window [s]", min_value=0.02, max_value=2.0, value=0.25, step=0.01)
+min_pts = st.sidebar.number_input("Min points per window", min_value=3, max_value=100, value=7, step=1)
+smooth_win = st.sidebar.number_input("Smoothing window [samples] (applied to V & I before derivative)", min_value=1, max_value=501, value=5, step=2)
+
+st.sidebar.subheader("Quasi-Steady-State Criteria")
+dwell_sec = st.sidebar.number_input("Required dwell time [s]", min_value=0.05, max_value=2.0, value=0.2, step=0.05)
+thr_v_user = st.sidebar.text_input("Max |dV/dt| [V/s] (leave blank to auto-suggest)", value="")
+thr_i_user = st.sidebar.text_input("Max |dI/dt| [A/s] (leave blank to auto-suggest)", value="")
+
+st.sidebar.subheader("Step Detection")
+min_step_V = st.sidebar.number_input("Minimum step size [V] to flag a step", min_value=0.01, max_value=5.0, value=0.25, step=0.01)
+min_sep = st.sidebar.number_input("Min separation between picks [s]", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
+
+st.sidebar.subheader("Export")
+want_export = st.sidebar.toggle("Enable CSV export", value=True)
+
+# --------------------- Load Data --------------------- #
+if demo and uploaded is None:
+    df = generate_synthetic_step_data()
+    st.success("Using synthetic demo data.")
+else:
+    if uploaded is not None:
+        try:
+            if uploaded.name.lower().endswith(".csv"):
+                df = pd.read_csv(uploaded)
+            else:
+                df = pd.read_excel(uploaded, engine="openpyxl")
+            st.success(f"Loaded file: {uploaded.name}")
+        except Exception as e:
+            st.error(f"Failed to load file: {e}")
+            st.stop()
+    else:
+        st.info("Upload a file or enable synthetic demo data.")
+        st.stop()
+
+# Column selectors
+with st.expander("Map columns (if names differ)", expanded=False):
+    cols = list(df.columns)
+    time_col = st.selectbox("Time column [s]", cols, index=cols.index(time_col_default) if time_col_default in cols else 0)
+    v_col = st.selectbox("Voltage column [V]", cols, index=cols.index(v_col_default) if v_col_default in cols else 0)
+    i_col = st.selectbox("Current column [A]", cols, index=cols.index(i_col_default) if i_col_default in cols else 0)
+
+# Clean and sort
+df = df[[time_col, v_col, i_col]].rename(columns={time_col: "time_s", v_col: "V_V", i_col: "I_A"}).copy()
+df = df.replace([np.inf, -np.inf], np.nan).dropna()
+df = df.sort_values("time_s")
+df = df[~df["time_s"].duplicated(keep="first")]
+
+if len(df) < 10:
+    st.error("Not enough data points after cleaning. Need at least 10.")
+    st.stop()
+
+# Optional smoothing before derivative
+df["V_smooth"] = moving_average(df["V_V"].to_numpy(), smooth_win)
+df["I_smooth"] = moving_average(df["I_A"].to_numpy(), smooth_win)
+
+# Derivatives
+t = df["time_s"].to_numpy()
+V = df["V_smooth"].to_numpy()
+I = df["I_smooth"].to_numpy()
+
+if method.startswith("Local"):
+    dVdt = local_linear_slope(t, V, window_sec=float(window_sec), min_points=int(min_pts))
+    dIdt = local_linear_slope(t, I, window_sec=float(window_sec), min_points=int(min_pts))
+else:
+    dVdt = safe_gradient(V, t)
+    dIdt = safe_gradient(I, t)
+
+df["dVdt_Vps"] = dVdt
+df["dIdt_Aps"] = dIdt
+
+# Suggest thresholds if user left blank
+if thr_v_user.strip() == "" or thr_i_user.strip() == "":
+    sv, si = suggest_thresholds(dVdt, dIdt, factor=3.0)
+    if np.isnan(sv) or sv <= 0:
+        sv = np.nanmax([np.nanpercentile(np.abs(dVdt), 10), 1e-3])
+    if np.isnan(si) or si <= 0:
+        si = np.nanmax([np.nanpercentile(np.abs(dIdt), 10), 1e-3])
+    thr_v = float(thr_v_user) if thr_v_user.strip() != "" else float(sv)
+    thr_i = float(thr_i_user) if thr_i_user.strip() != "" else float(si)
+else:
+    try:
+        thr_v = float(thr_v_user)
+        thr_i = float(thr_i_user)
+    except Exception:
+        st.error("Threshold inputs must be numeric.")
+        st.stop()
+
+# Pass/fail flags based on dwell
+pass_flags = dwell_pass_flags(t, dVdt, dIdt, thr_v=thr_v, thr_i=thr_i, dwell_sec=float(dwell_sec), method="last_window")
+df["QSS_pass"] = pass_flags
+
+# Step detection and recommended picks
+step_idx = detect_steps(df["V_V"].to_numpy(), min_step_V=float(min_step_V))
+picks = pick_recommended_points(t, V, I, pass_flags, step_idx, min_separation_sec=float(min_sep))
+df["Recommended"] = False
+if len(picks) > 0:
+    df.loc[df.index[picks], "Recommended"] = True
+
+# --------------------- Power and MPP derivs --------------------- #
+# Compute power
+df["P_W"] = df["V_V"] * df["I_A"]
+
+# Choose the set from which to determine MPP (traceable source)
+if len(picks) > 0:
+    mpp_source = "Recommended"
+    cand_idx = df.index[picks]
+elif df["QSS_pass"].any():
+    mpp_source = "QSS_pass"
+    cand_idx = df.index[df["QSS_pass"]]
+else:
+    mpp_source = "All samples"
+    cand_idx = df.index
+
+# Index of the MPP row within df
+mpp_idx = df.loc[cand_idx, "P_W"].idxmax()
+df["is_MPP"] = False
+df.at[mpp_idx, "is_MPP"] = True
+
+# Extract Vpmax, Ipmax, derivatives at MPP
+Vpmax = float(df.at[mpp_idx, "V_V"])
+Ipmax = float(df.at[mpp_idx, "I_A"])
+Pmax = float(df.at[mpp_idx, "P_W"])
+dVdt_mpp = float(df.at[mpp_idx, "dVdt_Vps"])
+dIdt_mpp = float(df.at[mpp_idx, "dIdt_Aps"])
+t_mpp = float(df.at[mpp_idx, "time_s"])
+qss_mpp = bool(df.at[mpp_idx, "QSS_pass"])
+
+# Power derivative at MPP (informative)
+dPdt_mpp = Ipmax * dVdt_mpp + Vpmax * dIdt_mpp
+
+# Threshold compliance at MPP
+pass_v_mpp = np.isfinite(dVdt_mpp) and (abs(dVdt_mpp) <= thr_v)
+pass_i_mpp = np.isfinite(dIdt_mpp) and (abs(dIdt_mpp) <= thr_i)
+
+# --------------------- Summary --------------------- #
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Samples", f"{len(df)}")
+c2.metric("QSS Pass (count)", f"{int(df['QSS_pass'].sum())}")
+c3.metric("Suggested |dV/dt| ≤ [V/s]", f"{thr_v:0.5f}")
+c4.metric("Suggested |dI/dt| ≤ [A/s]", f"{thr_i:0.5f}")
+
+st.caption("QSS = Quasi-Steady-State; a sample passes if both |dV/dt| and |dI/dt| remain below thresholds for the last dwell window.")
+
+# --------------------- MPP Block --------------------- #
+st.subheader("Maximum Power Point (derived dV/dt & dI/dt at MPP)")
+
+mc1, mc2, mc3, mc4 = st.columns(4)
+mc1.metric("Pmax [W]", f"{Pmax:0.3f}")
+mc2.metric("Vpmax [V]", f"{Vpmax:0.3f}")
+mc3.metric("Ipmax [A]", f"{Ipmax:0.3f}")
+mc4.metric("dP/dt @MPP [W/s]", f"{dPdt_mpp:0.5f}")
+
+mc5, mc6, mc7, mc8 = st.columns(4)
+mc5.metric("dV/dt @MPP [V/s]", f"{dVdt_mpp:0.5e}")
+mc6.metric("dI/dt @MPP [A/s]", f"{dIdt_mpp:0.5e}")
+mc7.metric("QSS @MPP", "PASS ✅" if qss_mpp else "FAIL ❌")
+mc8.metric("Source for MPP", mpp_source)
+
+with st.expander("MPP derivative compliance details", expanded=False):
+    mpp_tbl = pd.DataFrame([{
+        "time_s": t_mpp,
+        "V_V": Vpmax,
+        "I_A": Ipmax,
+        "P_W": Pmax,
+        "dVdt_Vps": dVdt_mpp,
+        "dIdt_Aps": dIdt_mpp,
+        "thr_Vps": thr_v,
+        "thr_Aps": thr_i,
+        "abs(dVdt)<=thr_v": bool(pass_v_mpp),
+        "abs(dIdt)<=thr_i": bool(pass_i_mpp),
+        "QSS_pass": qss_mpp,
+        "is_MPP": True,
+        "source": mpp_source
+    }])
+    st.dataframe(mpp_tbl, hide_index=True, use_container_width=True)
+
+# --------------------- Plots --------------------- #
+st.subheader("Time Series")
+
+fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+axs[0].plot(df["time_s"], df["V_V"], color="#1f77b4", label="V [raw]")
+axs[0].plot(df["time_s"], df["V_smooth"], color="#ff7f0e", alpha=0.8, label="V [smooth]")
+axs[0].set_ylabel("Voltage [V]")
+axs[0].legend(loc="upper right")
+axs[0].grid(True, alpha=0.3)
+
+axs[1].plot(df["time_s"], df["I_A"], color="#2ca02c", label="I [raw]")
+axs[1].plot(df["time_s"], df["I_smooth"], color="#d62728", alpha=0.8, label="I [smooth]")
+axs[1].set_ylabel("Current [A]")
+axs[1].legend(loc="upper right")
+axs[1].grid(True, alpha=0.3)
+
+axs[2].plot(df["time_s"], df["dVdt_Vps"], color="#9467bd", label="dV/dt")
+axs[2].plot(df["time_s"], df["dIdt_Aps"], color="#8c564b", label="dI/dt")
+axs[2].axhline(+thr_v, color="#9467bd", linestyle="--", alpha=0.5)
+axs[2].axhline(-thr_v, color="#9467bd", linestyle="--", alpha=0.5)
+axs[2].axhline(+thr_i, color="#8c564b", linestyle="--", alpha=0.5)
+axs[2].axhline(-thr_i, color="#8c564b", linestyle="--", alpha=0.5)
+axs[2].set_ylabel("Derivatives [V/s, A/s]")
+axs[2].set_xlabel("Time [s]")
+axs[2].legend(loc="upper right")
+axs[2].grid(True, alpha=0.3)
+
+# Mark recommended points
+if len(picks) > 0:
+    axs[0].scatter(df["time_s"].iloc[picks], df["V_smooth"].iloc[picks], color="k", marker="x", s=40, label="Recommended")
+    axs[1].scatter(df["time_s"].iloc[picks], df["I_smooth"].iloc[picks], color="k", marker="x", s=40)
+    axs[2].scatter(df["time_s"].iloc[picks], df["dVdt_Vps"].iloc[picks], color="k", marker="x", s=40)
+    axs[2].scatter(df["time_s"].iloc[picks], df["dIdt_Aps"].iloc[picks], color="k", marker="x", s=40)
+
+# Highlight MPP (time markers on all subplots)
+for ax in axs:
+    ax.axvline(t_mpp, color="red", linestyle=":", alpha=0.6)
+
+axs[0].scatter([t_mpp], [Vpmax], color="red", s=60, marker="*", zorder=5, label="MPP")
+axs[1].scatter([t_mpp], [Ipmax], color="red", s=60, marker="*", zorder=5)
+axs[2].scatter([t_mpp], [dVdt_mpp], color="red", s=60, marker="*", zorder=5)
+axs[2].scatter([t_mpp], [dIdt_mpp], color="red", s=60, marker="*", zorder=5)
+
+st.pyplot(fig, use_container_width=True)
+
+# IV scatter with pass/fail
+st.subheader("IV Curve with QSS Status")
+fig2, ax2 = plt.subplots(1, 1, figsize=(6, 5))
+mask_pass = df["QSS_pass"].to_numpy()
+ax2.scatter(df["V_V"][~mask_pass], df["I_A"][~mask_pass], s=12, color="#ff9896", label="Not QSS")
+ax2.scatter(df["V_V"][mask_pass], df["I_A"][mask_pass], s=12, color="#98df8a", label="QSS pass")
+if len(picks) > 0:
+    ax2.scatter(df["V_V"].iloc[picks], df["I_A"].iloc[picks], s=45, color="k", marker="x", label="Recommended")
+# MPP star
+ax2.scatter([Vpmax], [Ipmax], s=80, color="red", marker="*", label="MPP")
+ax2.set_xlabel("Voltage [V]")
+ax2.set_ylabel("Current [A]")
+ax2.grid(True, alpha=0.3)
+ax2.legend(loc="best")
+st.pyplot(fig2, use_container_width=True)
+
+# --------------------- Recommended points table --------------------- #
+st.subheader("Recommended Measurement Points (per step)")
+if len(picks) > 0:
+    out_cols = ["time_s", "V_V", "I_A", "P_W", "dVdt_Vps", "dIdt_Aps", "QSS_pass", "Recommended", "is_MPP"]
+    table = df.iloc[picks][out_cols].reset_index(drop=True)
+    st.dataframe(table, use_container_width=True, hide_index=True)
+else:
+    st.info("No recommended points found under the current thresholds/dwell time. Consider relaxing thresholds or increasing dwell.")
+
+# --------------------- Export --------------------- #
+if want_export:
+    export_cols = ["time_s", "V_V", "I_A", "P_W", "V_smooth", "I_smooth",
+                   "dVdt_Vps", "dIdt_Aps", "QSS_pass", "Recommended", "is_MPP"]
+    export_df = df[export_cols].copy()
+    export_df.attrs["notes"] = (
+        f"Method={method}, window_sec={window_sec}, min_points={min_pts}, "
+        f"smooth_win={smooth_win}, dwell_sec={dwell_sec}, thr_v={thr_v}, thr_i={thr_i}, "
+        f"min_step_V={min_step_V}, MPP_source={mpp_source}"
+    )
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download QC Report (CSV)",
+        data=csv_bytes,
+        file_name="qss_dvdt_didt_report.csv",
+        mime="text/csv"
+    )
+
+# --------------------- Guidance --------------------- #
+with st.expander("Notes & Guidance", expanded=False):
+    st.markdown(
+        """
+**What this app does**
+
+- Computes **dV/dt** and **dI/dt** per sample from time-series IV acquisition.
+- Flags samples that meet a **quasi-steady-state (QSS)** criterion:
+  both |dV/dt| and |dI/dt| must remain below thresholds for a configured **dwell window** immediately preceding the sample.
+- For **step-ramping** acquisitions, it auto-detects steps and proposes the first QSS-compliant point per step as a recommended measurement point.
+- **New:** Determines **Pmax** from the Recommended / QSS-pass points, and reports **dV/dt** and **dI/dt at the MPP** (plus **dP/dt**) for auditability.
+
+**Practical tips**
+
+- Choose the **local linear** derivative estimator, set window (e.g., 0.2–0.3 s) shorter than your dwell, and ensure enough samples per window.
+- Start with auto-suggested derivative thresholds, then **tighten** based on your instrument’s noise floor and device capacitance.
+- The **MPP derivatives** should be **well within** thresholds; consider stricter limits at MPP than elsewhere.
+
+**Data format**
+
+- CSV/Excel with columns for **time [s]**, **voltage [V]**, **current [A]**.
+- Sampling can be irregular; slopes are estimated robustly with **local linear regression**.
+
+**Disclaimer**
+
+- IEC 60904‑1:2020 allows **quasi‑steady-state** capture and does not prescribe fixed numeric derivative limits. Your lab should set and justify thresholds (e.g., via noise/MAD analysis and uncertainty budgets).
+        """
+    )
