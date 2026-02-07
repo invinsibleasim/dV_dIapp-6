@@ -39,7 +39,6 @@ def local_linear_slope(t, y, window_sec=0.3, min_points=5):
     y = np.asarray(y, dtype=float)
     n = len(t)
     slopes = np.full(n, np.nan)
-    # Use searchsorted on a sorted copy
     order = np.argsort(t)
     t_sorted = t[order]
     y_sorted = y[order]
@@ -52,8 +51,7 @@ def local_linear_slope(t, y, window_sec=0.3, min_points=5):
         if count >= min_points:
             tt = t_sorted[left:right]
             yy = y_sorted[left:right]
-            # Center times for numerical stability
-            tt_c = tt - tt.mean()
+            tt_c = tt - tt.mean()  # center times
             try:
                 p = np.polyfit(tt_c, yy, deg=1)  # yy ≈ p[0]*tt_c + p[1]
                 slopes[idx_sorted] = p[0]
@@ -62,7 +60,6 @@ def local_linear_slope(t, y, window_sec=0.3, min_points=5):
         else:
             slopes[idx_sorted] = np.nan
 
-    # Map back to original order
     inv_order = np.empty_like(order)
     inv_order[order] = np.arange(n)
     return slopes[inv_order]
@@ -291,7 +288,7 @@ else:
         st.error("Threshold inputs must be numeric.")
         st.stop()
 
-# Pass/fail flags based on dwell
+# Base QSS pass/fail flags (standard thresholds)
 pass_flags = dwell_pass_flags(t, dVdt, dIdt, thr_v=thr_v, thr_i=thr_i, dwell_sec=float(dwell_sec), method="last_window")
 df["QSS_pass"] = pass_flags
 
@@ -302,11 +299,11 @@ df["Recommended"] = False
 if len(picks) > 0:
     df.loc[df.index[picks], "Recommended"] = True
 
-# --------------------- Power and MPP derivs --------------------- #
-# Compute power
+# --------------------- Power & MPP determination --------------------- #
+# Power per sample
 df["P_W"] = df["V_V"] * df["I_A"]
 
-# Choose the set from which to determine MPP (traceable source)
+# Choose candidate set for MPP (traceable source)
 if len(picks) > 0:
     mpp_source = "Recommended"
     cand_idx = df.index[picks]
@@ -317,12 +314,12 @@ else:
     mpp_source = "All samples"
     cand_idx = df.index
 
-# Index of the MPP row within df
+# Index of the MPP row within df (max power among candidates)
 mpp_idx = df.loc[cand_idx, "P_W"].idxmax()
 df["is_MPP"] = False
 df.at[mpp_idx, "is_MPP"] = True
 
-# Extract Vpmax, Ipmax, derivatives at MPP
+# Extract values at MPP
 Vpmax = float(df.at[mpp_idx, "V_V"])
 Ipmax = float(df.at[mpp_idx, "I_A"])
 Pmax = float(df.at[mpp_idx, "P_W"])
@@ -331,12 +328,8 @@ dIdt_mpp = float(df.at[mpp_idx, "dIdt_Aps"])
 t_mpp = float(df.at[mpp_idx, "time_s"])
 qss_mpp = bool(df.at[mpp_idx, "QSS_pass"])
 
-# Power derivative at MPP (informative)
+# Informative: power derivative at MPP
 dPdt_mpp = Ipmax * dVdt_mpp + Vpmax * dIdt_mpp
-
-# Threshold compliance at MPP
-pass_v_mpp = np.isfinite(dVdt_mpp) and (abs(dVdt_mpp) <= thr_v)
-pass_i_mpp = np.isfinite(dIdt_mpp) and (abs(dIdt_mpp) <= thr_i)
 
 # --------------------- Summary --------------------- #
 c1, c2, c3, c4 = st.columns(4)
@@ -348,7 +341,7 @@ c4.metric("Suggested |dI/dt| ≤ [A/s]", f"{thr_i:0.5f}")
 st.caption("QSS = Quasi-Steady-State; a sample passes if both |dV/dt| and |dI/dt| remain below thresholds for the last dwell window.")
 
 # --------------------- MPP Block --------------------- #
-st.subheader("Maximum Power Point (derived dV/dt & dI/dt at MPP)")
+st.subheader("Maximum Power Point (VPmax, IPmax and their derivatives)")
 
 mc1, mc2, mc3, mc4 = st.columns(4)
 mc1.metric("Pmax [W]", f"{Pmax:0.3f}")
@@ -360,25 +353,20 @@ mc5, mc6, mc7, mc8 = st.columns(4)
 mc5.metric("dV/dt @MPP [V/s]", f"{dVdt_mpp:0.5e}")
 mc6.metric("dI/dt @MPP [A/s]", f"{dIdt_mpp:0.5e}")
 mc7.metric("QSS @MPP", "PASS ✅" if qss_mpp else "FAIL ❌")
-mc8.metric("Source for MPP", mpp_source)
+mc8.metric("MPP selected from", mpp_source)
 
-with st.expander("MPP derivative compliance details", expanded=False):
-    mpp_tbl = pd.DataFrame([{
+with st.expander("MPP details (traceability)"):
+    st.dataframe(pd.DataFrame([{
         "time_s": t_mpp,
         "V_V": Vpmax,
         "I_A": Ipmax,
         "P_W": Pmax,
         "dVdt_Vps": dVdt_mpp,
         "dIdt_Aps": dIdt_mpp,
-        "thr_Vps": thr_v,
-        "thr_Aps": thr_i,
-        "abs(dVdt)<=thr_v": bool(pass_v_mpp),
-        "abs(dIdt)<=thr_i": bool(pass_i_mpp),
         "QSS_pass": qss_mpp,
         "is_MPP": True,
         "source": mpp_source
-    }])
-    st.dataframe(mpp_tbl, hide_index=True, use_container_width=True)
+    }]), hide_index=True, use_container_width=True)
 
 # --------------------- Plots --------------------- #
 st.subheader("Time Series")
@@ -407,17 +395,15 @@ axs[2].set_xlabel("Time [s]")
 axs[2].legend(loc="upper right")
 axs[2].grid(True, alpha=0.3)
 
-# Mark recommended points
+# Mark recommended points (x) and MPP (star + vertical line)
 if len(picks) > 0:
     axs[0].scatter(df["time_s"].iloc[picks], df["V_smooth"].iloc[picks], color="k", marker="x", s=40, label="Recommended")
     axs[1].scatter(df["time_s"].iloc[picks], df["I_smooth"].iloc[picks], color="k", marker="x", s=40)
     axs[2].scatter(df["time_s"].iloc[picks], df["dVdt_Vps"].iloc[picks], color="k", marker="x", s=40)
     axs[2].scatter(df["time_s"].iloc[picks], df["dIdt_Aps"].iloc[picks], color="k", marker="x", s=40)
 
-# Highlight MPP (time markers on all subplots)
 for ax in axs:
     ax.axvline(t_mpp, color="red", linestyle=":", alpha=0.6)
-
 axs[0].scatter([t_mpp], [Vpmax], color="red", s=60, marker="*", zorder=5, label="MPP")
 axs[1].scatter([t_mpp], [Ipmax], color="red", s=60, marker="*", zorder=5)
 axs[2].scatter([t_mpp], [dVdt_mpp], color="red", s=60, marker="*", zorder=5)
@@ -433,7 +419,6 @@ ax2.scatter(df["V_V"][~mask_pass], df["I_A"][~mask_pass], s=12, color="#ff9896",
 ax2.scatter(df["V_V"][mask_pass], df["I_A"][mask_pass], s=12, color="#98df8a", label="QSS pass")
 if len(picks) > 0:
     ax2.scatter(df["V_V"].iloc[picks], df["I_A"].iloc[picks], s=45, color="k", marker="x", label="Recommended")
-# MPP star
 ax2.scatter([Vpmax], [Ipmax], s=80, color="red", marker="*", label="MPP")
 ax2.set_xlabel("Voltage [V]")
 ax2.set_ylabel("Current [A]")
@@ -478,21 +463,15 @@ with st.expander("Notes & Guidance", expanded=False):
 - Flags samples that meet a **quasi-steady-state (QSS)** criterion:
   both |dV/dt| and |dI/dt| must remain below thresholds for a configured **dwell window** immediately preceding the sample.
 - For **step-ramping** acquisitions, it auto-detects steps and proposes the first QSS-compliant point per step as a recommended measurement point.
-- **New:** Determines **Pmax** from the Recommended / QSS-pass points, and reports **dV/dt** and **dI/dt at the MPP** (plus **dP/dt**) for auditability.
+- **New:** Determines **Pmax** from the chosen candidate set and reports **dV/dt** and **dI/dt at the MPP** (plus **dP/dt**) for auditability.
 
 **Practical tips**
 
-- Choose the **local linear** derivative estimator, set window (e.g., 0.2–0.3 s) shorter than your dwell, and ensure enough samples per window.
-- Start with auto-suggested derivative thresholds, then **tighten** based on your instrument’s noise floor and device capacitance.
-- The **MPP derivatives** should be **well within** thresholds; consider stricter limits at MPP than elsewhere.
-
-**Data format**
-
-- CSV/Excel with columns for **time [s]**, **voltage [V]**, **current [A]**.
-- Sampling can be irregular; slopes are estimated robustly with **local linear regression**.
+- Choose the **local linear** derivative estimator; set the window (e.g., 0.2–0.3 s) shorter than your dwell, and ensure enough samples per window.
+- The **MPP derivatives** should be **near zero** if quasi-steady-state was achieved before capture.
 
 **Disclaimer**
 
-- IEC 60904‑1:2020 allows **quasi‑steady-state** capture and does not prescribe fixed numeric derivative limits. Your lab should set and justify thresholds (e.g., via noise/MAD analysis and uncertainty budgets).
+- IEC 60904‑1:2020 allows quasi‑steady‑state capture and does not prescribe fixed numeric derivative limits. Define lab‑specific limits based on your instruments’ noise floors and device capacitance.
         """
     )
