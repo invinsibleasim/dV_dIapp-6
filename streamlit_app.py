@@ -51,7 +51,7 @@ def local_linear_slope(t, y, window_sec=0.3, min_points=5):
         if count >= min_points:
             tt = t_sorted[left:right]
             yy = y_sorted[left:right]
-            tt_c = tt - tt.mean()  # center times
+            tt_c = tt - tt.mean()  # center times for numerical stability
             try:
                 p = np.polyfit(tt_c, yy, deg=1)  # yy ≈ p[0]*tt_c + p[1]
                 slopes[idx_sorted] = p[0]
@@ -62,7 +62,8 @@ def local_linear_slope(t, y, window_sec=0.3, min_points=5):
 
     inv_order = np.empty_like(order)
     inv_order[order] = np.arange(n)
-    return slopes[inv_order]
+    slopes_original = slopes[inv_order]
+    return slopes_original
 
 
 def safe_gradient(y, t):
@@ -75,7 +76,8 @@ def safe_gradient(y, t):
 
 def detect_steps(V, min_step_V=0.25):
     """
-    Return indices where a new step likely begins (simple |ΔV| threshold).
+    Return indices where a new step likely begins.
+    Uses difference between medians over a small neighborhood.
     """
     V = np.asarray(V)
     dv = np.diff(V, prepend=V[0])
@@ -87,8 +89,10 @@ def detect_steps(V, min_step_V=0.25):
 
 def dwell_pass_flags(t, dVdt, dIdt, thr_v, thr_i, dwell_sec=0.2, method="last_window"):
     """
-    True if for each sample i, both |dV/dt| <= thr_v and |dI/dt| <= thr_i
-    for the entire interval [t[i]-dwell_sec, t[i]].
+    Returns boolean array indicating that *both* |dV/dt| <= thr_v and |dI/dt| <= thr_i
+    for at least dwell_sec immediately before (and including) each sample (method='last_window').
+
+    For each time t[i], we check all samples s with t in [t[i]-dwell_sec, t[i]].
     """
     t = np.asarray(t)
     dVdt = np.asarray(dVdt)
@@ -124,12 +128,15 @@ def pick_recommended_points(t, V, I, pass_flags, step_idx, min_separation_sec=0.
 
     for s in step_idx:
         i = s
+        found = False
         while i < n:
             if pass_flags[i] and (t[i] - last_time >= min_separation_sec):
                 chosen.append(i)
                 last_time = t[i]
+                found = True
                 break
             i += 1
+        # If not found, skip this step
     return np.array(chosen, dtype=int)
 
 
@@ -150,8 +157,12 @@ def generate_synthetic_step_data(
 ):
     """
     Simulate a step-ramped IV acquisition with capacitive transient.
-    V(t): first-order response to target with time constant tau_s
-    I(t) = I0 - G*V + C * dV/dt + noise
+
+    Model:
+      V(t) follows a first-order response to step target with time constant tau_s
+      I(t) = I0 - G*V + C * dV/dt + noise
+
+    Returns DataFrame with columns: time_s, V_V, I_A
     """
     total_time = n_steps * step_hold_s
     dt = 1.0 / sample_rate_hz
@@ -182,7 +193,8 @@ def generate_synthetic_step_data(
     Vn = V + rng.normal(0, noise_V, size=len(V))
     In = I + rng.normal(0, noise_I, size=len(I))
 
-    return pd.DataFrame({"time_s": t, "V_V": Vn, "I_A": In})
+    df = pd.DataFrame({"time_s": t, "V_V": Vn, "I_A": In})
+    return df
 
 
 # --------------------- UI – Sidebar --------------------- #
@@ -288,7 +300,7 @@ else:
         st.error("Threshold inputs must be numeric.")
         st.stop()
 
-# Base QSS pass/fail flags (standard thresholds)
+# Pass/fail flags based on dwell
 pass_flags = dwell_pass_flags(t, dVdt, dIdt, thr_v=thr_v, thr_i=thr_i, dwell_sec=float(dwell_sec), method="last_window")
 df["QSS_pass"] = pass_flags
 
@@ -462,16 +474,12 @@ with st.expander("Notes & Guidance", expanded=False):
 - Computes **dV/dt** and **dI/dt** per sample from time-series IV acquisition.
 - Flags samples that meet a **quasi-steady-state (QSS)** criterion:
   both |dV/dt| and |dI/dt| must remain below thresholds for a configured **dwell window** immediately preceding the sample.
-- For **step-ramping** acquisitions, it auto-detects steps and proposes the first QSS-compliant point per step as a recommended measurement point.
-- **New:** Determines **Pmax** from the chosen candidate set and reports **dV/dt** and **dI/dt at the MPP** (plus **dP/dt**) for auditability.
+- Detects steps and proposes the **first QSS-compliant** point per step as **Recommended**.
+- **New:** Determines **Pmax = V×I** from Recommended → QSS_pass → All samples, and reports
+  **dV/dt** and **dI/dt at the MPP** (plus **dP/dt**) for auditability.
 
-**Practical tips**
-
-- Choose the **local linear** derivative estimator; set the window (e.g., 0.2–0.3 s) shorter than your dwell, and ensure enough samples per window.
-- The **MPP derivatives** should be **near zero** if quasi-steady-state was achieved before capture.
-
-**Disclaimer**
-
-- IEC 60904‑1:2020 allows quasi‑steady‑state capture and does not prescribe fixed numeric derivative limits. Define lab‑specific limits based on your instruments’ noise floors and device capacitance.
+**Tip**
+- For accreditation, cite your lab’s derivative thresholds and dwell rule.
+- At MPP, both **|dV/dt|** and **|dI/dt|** should be near zero; **dP/dt = I·dV/dt + V·dI/dt** should also be small.
         """
     )
