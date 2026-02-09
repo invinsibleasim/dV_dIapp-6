@@ -224,7 +224,7 @@ st.sidebar.subheader("Step Detection")
 min_step_V = st.sidebar.number_input("Minimum step size [V] to flag a step", min_value=0.01, max_value=5.0, value=0.25, step=0.01)
 min_sep = st.sidebar.number_input("Min separation between picks [s]", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
 
-# -------- NEW: Near-MPP band controls -------- #
+# Near-MPP band controls
 st.sidebar.subheader("Near‑MPP Reporting")
 near_pct = st.sidebar.number_input("Near‑MPP band [% of Pmax]", min_value=0.1, max_value=10.0, value=2.0, step=0.1,
                                    help="Show points with P >= (1 - band%) * Pmax, from the selected candidate set.")
@@ -316,22 +316,23 @@ df["Recommended"] = False
 if len(picks) > 0:
     df.loc[df.index[picks], "Recommended"] = True
 
-# --------------------- Power & MPP determination --------------------- #
+# --------------------- Power & MPP determination (QSS-only enforced) --------------------- #
 # Power per sample from raw V and I (not smoothed)
 df["P_W"] = df["V_V"] * df["I_A"]
 
-# Candidate set for MPP determination (traceable, with safe fallback)
-if len(picks) > 0:
-    mpp_source = "Recommended"
-    cand_idx = df.index[picks]
-elif df["QSS_pass"].any():
-    mpp_source = "QSS_pass"
-    cand_idx = df.index[df["QSS_pass"]]
-else:
-    mpp_source = "All samples"
-    cand_idx = df.index
+# Candidates are ONLY the samples that pass the base QSS criterion (dwell-based).
+qss_candidates = df.index[df["QSS_pass"]]
+if len(qss_candidates) == 0:
+    st.error(
+        "No quasi-steady-state (QSS) samples found under current thresholds/dwell. "
+        "Relax thresholds or increase dwell to obtain QSS-pass data points."
+    )
+    st.stop()
 
-# Index of the MPP row within df (max power among candidates)
+cand_idx = qss_candidates
+mpp_source = "QSS_pass (enforced)"
+
+# Index of the MPP row within df (max power among QSS-only candidates)
 mpp_idx = df.loc[cand_idx, "P_W"].idxmax()
 df["is_MPP"] = False
 df.at[mpp_idx, "is_MPP"] = True
@@ -343,11 +344,11 @@ Pmax  = float(df.at[mpp_idx, "P_W"])
 dVdt_mpp = float(df.at[mpp_idx, "dVdt_Vps"])
 dIdt_mpp = float(df.at[mpp_idx, "dIdt_Aps"])
 t_mpp = float(df.at[mpp_idx, "time_s"])
-qss_mpp = bool(df.at[mpp_idx, "QSS_pass"])
+qss_mpp = True  # by construction (picked only from QSS_pass)
 # Informative power derivative at MPP
 dPdt_mpp = Ipmax * dVdt_mpp + Vpmax * dIdt_mpp
 
-# Near‑MPP band (within near_pct% of Pmax, restricted to same candidate set)
+# Near‑MPP band (within near_pct% of Pmax, restricted to same QSS-only candidate set)
 near_threshold = (1.0 - near_pct / 100.0) * Pmax
 cand_df = df.loc[cand_idx].copy()
 near_df = cand_df[cand_df["P_W"] >= near_threshold].copy()
@@ -364,7 +365,7 @@ c4.metric("Suggested |dI/dt| ≤ [A/s]", f"{thr_i:0.5f}")
 st.caption("QSS = Quasi-Steady-State; a sample passes if both |dV/dt| and |dI/dt| remain below thresholds for the last dwell window.")
 
 # --------------------- MPP Block --------------------- #
-st.subheader("Maximum Power Point (VPmax, IPmax, and derivatives at MPP)")
+st.subheader("Maximum Power Point (VPmax, IPmax, and derivatives at MPP)  —  QSS-only enforced")
 mc1, mc2, mc3, mc4 = st.columns(4)
 mc1.metric("Pmax [W]", f"{Pmax:0.3f}")
 mc2.metric("Vpmax [V]", f"{Vpmax:0.3f}")
@@ -436,7 +437,7 @@ if len(picks) > 0:
     ax2.scatter(df["V_V"].iloc[picks], df["I_A"].iloc[picks], s=45, color="k", marker="x", label="Recommended")
 # MPP star
 ax2.scatter([Vpmax], [Ipmax], s=80, color="red", marker="*", label="MPP")
-# Near‑MPP points (small gray markers)
+# Near‑MPP points (small gray markers), restricted to QSS-only candidates
 if len(near_df) > 0:
     ax2.scatter(near_df["V_V"], near_df["I_A"], s=18, color="gray", alpha=0.6, label=f"Near‑MPP (≥{100-near_pct:.1f}% Pmax)")
 ax2.set_xlabel("Voltage [V]")
@@ -493,12 +494,12 @@ with st.expander("Notes & Guidance", expanded=False):
 - Computes **dV/dt** and **dI/dt** per sample from time-series IV acquisition.
 - Applies a **quasi-steady-state (QSS)** check using dwell-based derivative thresholds.
 - Detects steps and proposes the **first QSS-compliant** point per step as **Recommended**.
-- Computes **power** per sample (**P = V×I**) and determines **Pmax** (the point used for **VPmax** and **IPmax**).
-- Reports **dV/dt** and **dI/dt** **at the MPP sample**, and lists **near‑MPP** samples within a configurable **Pmax band**.
+- Computes **power** per sample (**P = V×I**) and determines **Pmax**.
+- **QSS-only enforced:** MPP and near‑MPP are selected **only** from **QSS-pass** samples.
 
 **Tips**
 
 - Use the **Local linear** derivative estimator; set the window a bit **shorter than dwell**.
-- For high‑capacitance modules, consider larger dwell or tighter thresholds; dP/dt at MPP should be **very small** if QSS is satisfied.
+- For high‑capacitance modules, consider larger dwell or tighter thresholds; **dP/dt at MPP** should be **very small** if QSS is satisfied.
         """
     )
