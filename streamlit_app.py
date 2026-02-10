@@ -26,7 +26,7 @@ def robust_mad(x):
     x = np.asarray(x)
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
-    return med, 1.4826 * mad  # approx std from MAD
+    return med, 2 * mad  # approx std from MAD
 
 
 def local_linear_slope(t, y, window_sec=0.3, min_points=5):
