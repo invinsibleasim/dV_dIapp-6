@@ -1,289 +1,302 @@
 # streamlit_app.py
-# Formula-based dV/dt & dI/dt per point with IEC 60904-1:2020 QSS enforcement
+import io
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(
-    page_title="Formula-based dV/dt & dI/dt per point – IEC 60904-1:2020 QSS",
-    layout="wide",
-    page_icon="⚡"
-)
+st.set_page_config(page_title="dV/dt & dI/dt – Quasi-Steady-State (IEC 60904-1:2020)",
+                   layout="wide",
+                   page_icon="⚡")
 
-# ============================ Utilities ============================ #
+# --------------------- Utilities --------------------- #
+def moving_average(x, window):
+    if window <= 1:
+        return x
+    window = int(window)
+    if window % 2 == 0:
+        window += 1
+    kernel = np.ones(window) / window
+    x_pad = np.pad(x, (window//2, window//2), mode="edge")
+    return np.convolve(x_pad, kernel, mode="valid")
+
+
 def robust_mad(x):
-    """Return (median, 1.4826*MAD) as a robust σ estimate."""
-    x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return np.nan, np.nan
+    x = np.asarray(x)
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
-    return med, 1.4826 * mad
+    return med, 1.4826 * mad  # approx std from MAD
 
-def suggest_thresholds(dVdt, dIdt, factor=3.0):
-    """Auto-suggest derivative thresholds from noise floor (MAD-based)."""
-    _, sig_v = robust_mad(dVdt[np.isfinite(dVdt)])
-    _, sig_i = robust_mad(dIdt[np.isfinite(dIdt)])
-    thr_v = factor * sig_v if (np.isfinite(sig_v) and sig_v > 0) else np.nan
-    thr_i = factor * sig_i if (np.isfinite(sig_i) and sig_i > 0) else np.nan
-    return thr_v, thr_i
 
-def finite_diff(y, t, mode="backward"):
+def local_linear_slope(t, y, window_sec=0.3, min_points=5):
     """
-    Formula-based dy/dt per point with irregular t support.
-    mode:
-      - 'backward': dy/dt[i] = (y[i]-y[i-1])/(t[i]-t[i-1]); dy/dt[0] = NaN
-      - 'forward' : dy/dt[i] = (y[i+1]-y[i])/(t[i+1]-t[i]); dy/dt[-1] = NaN
-      - 'central' : dy/dt[i] = (y[i+1]-y[i-1])/(t[i+1]-t[i-1]) for 1..n-2;
-                    ends use backward/forward
-    NaN where Δt == 0 (division by zero avoided).
+    Robust slope estimate dy/dt via local linear regression in a time window centered at each sample.
+    Handles irregular sampling.
+    Returns: slope array (same length as y); NaN where insufficient points.
     """
-    y = np.asarray(y, float)
-    t = np.asarray(t, float)
-    n = len(y)
-    out = np.full(n, np.nan)
-
-    if n < 2:
-        return out
-
-    if mode == "backward":
-        dt = t[1:] - t[:-1]
-        dy = y[1:] - y[:-1]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out[1:] = np.where(dt != 0, dy / dt, np.nan)
-
-    elif mode == "forward":
-        dt = t[1:] - t[:-1]
-        dy = y[1:] - y[:-1]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out[:-1] = np.where(dt != 0, dy / dt, np.nan)
-
-    else:  # central
-        if n >= 3:
-            dtc = t[2:] - t[:-2]
-            dyc = y[2:] - y[:-2]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                out[1:-1] = np.where(dtc != 0, dyc / dtc, np.nan)
-        # end-point fallbacks:
-        dt0 = t[1] - t[0]
-        out[0] = (y[1] - y[0]) / dt0 if dt0 != 0 else np.nan
-        dtn = t[-1] - t[-2]
-        out[-1] = (y[-1] - y[-2]) / dtn if dtn != 0 else np.nan
-
-    return out
-
-def dwell_pass_flags(t, dVdt, dIdt, thr_v, thr_i, dwell_sec):
-    """
-    IEC QSS rule:
-    For each sample i, both |dV/dt| and |dI/dt| must remain <= thresholds
-    throughout the interval [t[i]-dwell_sec, t[i]].
-    """
-    t = np.asarray(t, float)
-    dv = np.asarray(dVdt, float)
-    di = np.asarray(dIdt, float)
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
     n = len(t)
-    out = np.zeros(n, dtype=bool)
-    for i in range(n):
-        L = np.searchsorted(t, t[i] - dwell_sec, side="left")
-        R = i + 1
-        if R - L >= 2:  # need at least two points in dwell
-            ok_v = np.nanmax(np.abs(dv[L:R])) <= thr_v
-            ok_i = np.nanmax(np.abs(di[L:R])) <= thr_i
-            out[i] = bool(ok_v and ok_i)
-    return out
+    slopes = np.full(n, np.nan)
+    # Use searchsorted on a sorted copy
+    order = np.argsort(t)
+    t_sorted = t[order]
+    y_sorted = y[order]
 
-def detect_steps(V, t, min_step_V=0.25, min_step_gap=0.01):
+    for idx_sorted in range(n):
+        t0 = t_sorted[idx_sorted]
+        left = np.searchsorted(t_sorted, t0 - window_sec/2, side="left")
+        right = np.searchsorted(t_sorted, t0 + window_sec/2, side="right")
+        count = right - left
+        if count >= min_points:
+            tt = t_sorted[left:right]
+            yy = y_sorted[left:right]
+            # Center times for numerical stability
+            tt_c = tt - tt.mean()
+            try:
+                p = np.polyfit(tt_c, yy, deg=1)  # yy ≈ p[0]*tt_c + p[1]
+                slopes[idx_sorted] = p[0]        # dy/dt
+            except Exception:
+                slopes[idx_sorted] = np.nan
+        else:
+            slopes[idx_sorted] = np.nan
+
+    # Map back to original order
+    inv_order = np.empty_like(order)
+    inv_order[order] = np.arange(n)
+    slopes_original = slopes[inv_order]
+    return slopes_original
+
+
+def safe_gradient(y, t):
+    y = np.asarray(y, dtype=float)
+    t = np.asarray(t, dtype=float)
+    # gradient with respect to time (handles irregular spacing)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dy = np.gradient(y, t)
+    return dy
+
+
+def detect_steps(V, min_step_V=0.25):
     """
-    Step detection by |ΔV|, ensuring minimal time between step starts.
-    Always include index 0 as the first step.
+    Return indices where a new step likely begins (simple |ΔV| threshold).
     """
-    V = np.asarray(V, float)
-    t = np.asarray(t, float)
+    V = np.asarray(V)
     dv = np.diff(V, prepend=V[0])
-    cand = np.where(np.abs(dv) >= float(min_step_V))[0]
-    steps = [0]
-    last = t[0] if len(t) else 0.0
-    for idx in cand:
-        if t[idx] - last >= float(min_step_gap):
-            steps.append(int(idx))
-            last = t[idx]
-    return np.unique(np.array(steps, dtype=int))
+    step_idx = np.where(np.abs(dv) >= min_step_V)[0]
+    if len(step_idx) == 0 or step_idx[0] != 0:
+        step_idx = np.insert(step_idx, 0, 0)
+    return np.unique(step_idx)
 
-def pick_first_qss_per_step(t, qss_flags, step_starts, min_spacing_sec=0.0):
-    """For each step start, pick FIRST index at/after start where QSS is True, with minimal time spacing enforced."""
-    t = np.asarray(t, float)
-    picks, last_t = [], -np.inf
-    for s in step_starts:
-        i = int(s)
-        while i < len(t):
-            if qss_flags[i] and (t[i] - last_t >= min_spacing_sec):
-                picks.append(i)
-                last_t = t[i]
+
+def dwell_pass_flags(t, dVdt, dIdt, thr_v, thr_i, dwell_sec=0.2, method="last_window"):
+    """
+    Returns boolean array indicating that *both* |dV/dt| <= thr_v and |dI/dt| <= thr_i
+    for at least dwell_sec immediately before (and including) each sample.
+    """
+    t = np.asarray(t)
+    dVdt = np.asarray(dVdt)
+    dIdt = np.asarray(dIdt)
+    n = len(t)
+    flags = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        t0 = t[i] - dwell_sec
+        left = np.searchsorted(t, t0, side="left")
+        right = i + 1
+        if right - left < 2:
+            flags[i] = False
+            continue
+        ok_v = np.nanmax(np.abs(dVdt[left:right])) <= thr_v
+        ok_i = np.nanmax(np.abs(dIdt[left:right])) <= thr_i
+        flags[i] = bool(ok_v and ok_i)
+    return flags
+
+
+def pick_recommended_points(t, V, I, pass_flags, step_idx, min_separation_sec=0.05):
+    """
+    For each detected step, choose the first time index where pass_flags is True,
+    and ensure selections are not too close in time (min_separation_sec).
+    """
+    t = np.asarray(t)
+    n = len(t)
+    chosen = []
+    last_time = -np.inf
+
+    step_idx = np.asarray(step_idx)
+    step_idx = step_idx[step_idx < n]
+
+    for s in step_idx:
+        # From step start to end, pick first pass
+        i = s
+        found = False
+        while i < n:
+            if pass_flags[i] and (t[i] - last_time >= min_separation_sec):
+                chosen.append(i)
+                last_time = t[i]
+                found = True
                 break
             i += 1
-    return np.array(picks, dtype=int)
+        # If not found, skip
+    return np.array(chosen, dtype=int)
 
-# ============================ Sidebar ============================ #
+
+def suggest_thresholds(dVdt, dIdt, factor=3.0):
+    """
+    Suggest thresholds based on robust noise floor (MAD-based).
+    """
+    _, sigma_v = robust_mad(dVdt[np.isfinite(dVdt)])
+    _, sigma_i = robust_mad(dIdt[np.isfinite(dIdt)])
+    thr_v = factor * sigma_v if np.isfinite(sigma_v) and sigma_v > 0 else np.nan
+    thr_i = factor * sigma_i if np.isfinite(sigma_i) and sigma_i > 0 else np.nan
+    return thr_v, thr_i
+
+
+def generate_synthetic_step_data(
+    n_steps=15, step_V=(0.0, 45.0), step_hold_s=0.5, tau_s=0.08,
+    sample_rate_hz=200, I0_A=9.0, G_S=0.18, C_F=0.04, noise_V=0.001, noise_I=0.02
+):
+    """
+    Simulate a step-ramped IV acquisition with capacitive transient.
+
+    Model:
+      V(t) follows a first-order response to step target with time constant tau_s
+      I(t) = I0 - G*V + C * dV/dt + noise
+    """
+    total_time = n_steps * step_hold_s
+    dt = 1.0 / sample_rate_hz
+    t = np.arange(0, total_time, dt)
+
+    # Create target step sequence
+    V_targets = np.linspace(step_V[0], step_V[1], n_steps)
+    V_target_t = np.zeros_like(t)
+    step_times = np.arange(0, total_time, step_hold_s)
+    for k, ts in enumerate(step_times):
+        idx0 = int(ts / dt)
+        V_target_t[idx0:] = V_targets[k]
+
+    # First-order RC response for V
+    V = np.zeros_like(t)
+    for i in range(1, len(t)):
+        dV = (V_target_t[i] - V[i-1]) * (dt / tau_s)
+        V[i] = V[i-1] + dV
+
+    # Derivative dV/dt (true)
+    dVdt_true = np.gradient(V, t)
+
+    # Current with conductance and capacitive term
+    I = (I0_A - G_S * V) + C_F * dVdt_true
+
+    # Add noise
+    rng = np.random.default_rng(42)
+    Vn = V + rng.normal(0, noise_V, size=len(V))
+    In = I + rng.normal(0, noise_I, size=len(I))
+
+    return pd.DataFrame({"time_s": t, "V_V": Vn, "I_A": In})
+
+
+# --------------------- UI – Sidebar --------------------- #
 st.sidebar.header("Configuration")
 
 st.sidebar.subheader("Data Input")
-uploaded = st.sidebar.file_uploader("Upload CSV (tab/comma) or Excel", type=["csv", "xlsx"])
-demo = st.sidebar.toggle("Use a small demo snippet (if no file uploaded)", value=(uploaded is None))
+demo = st.sidebar.toggle("Use synthetic demo data", value=True, help="Generate a realistic step-ramp with capacitive transients.")
+uploaded = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
-st.sidebar.subheader("Column Mapping")
-time_default = "TimeOffset"  # your table header
-v_default    = "Vraw"        # your table header
-i_default    = "Iraw"        # your table header
-p_default    = "Praw"        # optional
+time_col_default = "time_s"
+v_col_default = "V_V"
+i_col_default = "I_A"
 
-st.sidebar.subheader("Derivative Scheme")
-scheme_label = st.sidebar.selectbox(
-    "Finite difference formula",
-    ["Backward (V[i]-V[i-1])/Δt", "Central (V[i+1]-V[i-1])/Δt", "Forward (V[i+1]-V[i])/Δt"],
-    index=0
-)
-scheme_map = {
-    "Backward (V[i]-V[i-1])/Δt": "backward",
-    "Central (V[i+1]-V[i-1])/Δt": "central",
-    "Forward (V[i+1]-V[i])/Δt": "forward",
-}
-scheme = scheme_map[scheme_label]
+# Derivative controls
+st.sidebar.subheader("Derivative Estimation")
+method = st.sidebar.selectbox("Method", ["Local linear (recommended)", "Gradient"], index=0,
+                              help="Local linear fit in a time window is robust to noise and irregular sampling.")
+window_sec = st.sidebar.number_input("Local linear window [s]", min_value=0.02, max_value=2.0, value=0.25, step=0.01)
+min_pts = st.sidebar.number_input("Min points per window", min_value=3, max_value=100, value=7, step=1)
+smooth_win = st.sidebar.number_input("Smoothing window [samples] (applied to V & I before derivative)", min_value=1, max_value=501, value=5, step=2)
 
-st.sidebar.subheader("QSS (IEC 60904-1:2020)")
-dwell_sec = st.sidebar.number_input("Dwell time [s] (look-back window)", min_value=0.0001, max_value=2.0, value=0.0020, step=0.0001, format="%.4f")
-thr_v_user = st.sidebar.text_input("Max |dV/dt| [V/s] (leave blank = auto)", value="")
-thr_i_user = st.sidebar.text_input("Max |dI/dt| [A/s] (leave blank = auto)", value="")
+st.sidebar.subheader("Quasi-Steady-State Criteria")
+dwell_sec = st.sidebar.number_input("Required dwell time [s]", min_value=0.05, max_value=2.0, value=0.2, step=0.05)
+thr_v_user = st.sidebar.text_input("Max |dV/dt| [V/s] (leave blank to auto-suggest)", value="")
+thr_i_user = st.sidebar.text_input("Max |dI/dt| [A/s] (leave blank to auto-suggest)", value="")
 
 st.sidebar.subheader("Step Detection")
-min_step_V  = st.sidebar.number_input("Min step size [V]", min_value=0.001, max_value=10.0, value=0.25, step=0.001)
-min_step_gap = st.sidebar.number_input("Min time gap between steps [s]", min_value=0.0, max_value=1.0, value=0.001, step=0.0005, format="%.4f")
-min_pick_gap = st.sidebar.number_input("Min spacing between picked points [s]", min_value=0.0, max_value=1.0, value=0.0005, step=0.0005, format="%.4f")
+min_step_V = st.sidebar.number_input("Minimum step size [V] to flag a step", min_value=0.01, max_value=5.0, value=0.25, step=0.01)
+min_sep = st.sidebar.number_input("Min separation between picks [s]", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
 
+# Near-MPP band controls
+st.sidebar.subheader("Near‑MPP Reporting")
+near_pct = st.sidebar.number_input("Near‑MPP band [% of Pmax]", min_value=0.1, max_value=10.0, value=2.0, step=0.1,
+                                   help="Show points with P >= (1 - band%) * Pmax, from the selected candidate set.")
+near_max_rows = st.sidebar.number_input("Max rows in near‑MPP table", min_value=5, max_value=200, value=30, step=5)
+
+st.sidebar.subheader("Export")
 want_export = st.sidebar.toggle("Enable CSV export", value=True)
 
-# ============================ Load Data ============================ #
-if demo:
-    demo_text = """TimeOffset\tVimp\tIraw\tVraw\tPraw\tdV/dt\tdI/dt
-0\t-0.81\t11.6009\t7.2096\t83.63784864\t-949\t-806
-0.0001\t-2.7\t12.4615\t5.5231\t68.82611065\t-527\t-275
-0.0002\t-4.41\t12.9625\t4.0053\t51.91870125\t-1054\t-177
-0.0003\t-6.3\t13.1786\t2.1186\t27.92018196\t-738\t-20
-0.0004\t-8.1\t13.2867\t0.3795\t5.04230265\t-738\t-118
-0.0005\t-8.1406\t13.3142\t-0.4111\t-5.47346762\t-210\t39
-0.0006\t-8.1406\t13.324\t-0.4427\t-5.8985348\t-105\t39
-0.0007\t-8.1406\t13.3358\t-0.4427\t-5.90375866\t-105\t-98
-0.0008\t-8.1406\t13.3456\t-0.4427\t-5.90809712\t0\t-138
-0.0009\t-8.1406\t13.3653\t-0.4216\t-5.63481048\t0\t0
-0.001\t-8.1406\t13.3692\t-0.4216\t-5.63645472\t-211\t-39
-0.0011\t-8.1406\t13.3731\t-0.4216\t-5.63809896\t0\t-40
-0.0012\t-8.1406\t13.3751\t-0.4005\t-5.35672755\t0\t0
-0.0013\t-8.1406\t13.381\t-0.4111\t-5.5009291\t0\t-78
-0.0014\t-8.1406\t13.381\t-0.4216\t-5.6414296\t-105\t20
-0.0015\t-8.1406\t13.381\t-0.4111\t-5.5009291\t-105\t0
-0.0016\t-8.1406\t13.3888\t-0.4111\t-5.50413568\t106\t19
-0.0017\t-5.4369\t13.3692\t-0.3794\t-5.07227448\t1159\t216
-0.0018\t-5.4369\t13.3653\t2.2873\t30.57045069\t105\t-39
-0.0019\t-5.4369\t13.3771\t2.34\t31.302414\t-106\t-19
-0.002\t-5.4369\t13.3731\t2.34\t31.293054\t-106\t-40
-0.0021\t32.0036\t13.1983\t38.8727\t513.0535564\t1159\t649
-0.0022\t32.0036\t13.1432\t39.8845\t524.2099604\t0\t117
-0.0023\t32.0036\t13.1118\t40.0532\t525.1695478\t-211\t0
-0.0024\t32.0036\t13.1197\t40.0848\t525.9005506\t-106\t0
-0.0025\t32.0036\t13.1295\t40.0637\t526.0163492\t-316\t0
-0.0026\t32.0036\t13.1413\t39.9899\t525.5192729\t106\t39
-0.0027\t32.0036\t13.1491\t39.9478\t525.277617\t-317\t0
-0.0028\t33.869\t12.3593\t41.4656\t512.4857901\t737\t-393
-0.0029\t33.869\t12.9173\t41.5921\t537.2576333\t-106\t59
-"""
-    from io import StringIO
-    df = pd.read_csv(StringIO(demo_text), sep="\t")
+# --------------------- Load Data --------------------- #
+if demo and uploaded is None:
+    df = generate_synthetic_step_data()
+    st.success("Using synthetic demo data.")
 else:
-    if uploaded is None:
-        st.info("Upload a file or enable demo.")
-        st.stop()
-    try:
-        if uploaded.name.lower().endswith(".csv"):
-            # auto-detect separator
-            try:
-                df = pd.read_csv(uploaded, sep=None, engine="python")
-            except Exception:
+    if uploaded is not None:
+        try:
+            if uploaded.name.lower().endswith(".csv"):
                 df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_excel(uploaded, engine="openpyxl")
-    except Exception as e:
-        st.error(f"Failed to load file: {e}")
+            else:
+                df = pd.read_excel(uploaded, engine="openpyxl")
+            st.success(f"Loaded file: {uploaded.name}")
+        except Exception as e:
+            st.error(f"Failed to load file: {e}")
+            st.stop()
+    else:
+        st.info("Upload a file or enable synthetic demo data.")
         st.stop()
 
-# ============================ Column Mapping (FIXED) ============================ #
-with st.expander("Map columns", expanded=True):
+# Column selectors
+with st.expander("Map columns (if names differ)", expanded=False):
     cols = list(df.columns)
-    time_col = st.selectbox("Time column [s]", cols, index=cols.index(time_default) if time_default in cols else 0)
-    v_col    = st.selectbox("Voltage column [V]", cols, index=cols.index(v_default) if v_default in cols else 1)
-    i_col    = st.selectbox("Current column [A]", cols, index=cols.index(i_default) if i_default in cols else 2)
-    p_col    = st.selectbox("Power column [W] (optional)", ["<none>"] + cols, index=(cols.index(p_default)+1 if p_default in cols else 0))
+    time_col = st.selectbox("Time column [s]", cols, index=cols.index(time_col_default) if time_col_default in cols else 0)
+    v_col = st.selectbox("Voltage column [V]", cols, index=cols.index(v_col_default) if v_col_default in cols else 0)
+    i_col = st.selectbox("Current column [A]", cols, index=cols.index(i_col_default) if i_col_default in cols else 0)
 
-# Build selection list
-select_cols = [time_col, v_col, i_col] + ([p_col] if p_col != "<none>" else [])
-df = df[select_cols].copy()
-
-# Safe renaming (DO NOT touch time unless mapping)
-rename_map = {time_col: "time_s", v_col: "V", i_col: "I"}
-if p_col != "<none>":
-    rename_map[p_col] = "P"
-df = df.rename(columns=rename_map).copy()
-
-# Coerce numerics robustly
-for c in ["time_s", "V", "I"]:
-    df[c] = pd.to_numeric(df[c], errors="coerce")
-if p_col != "<none>":
-    df["P"] = pd.to_numeric(df["P"], errors="coerce")
-
-# Drop non-numeric rows in required columns
-df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["time_s", "V", "I"])
-if p_col == "<none>":
-    df["P"] = df["V"] * df["I"]
-else:
-    df = df.dropna(subset=["P"])
-
-# Enforce strictly increasing time & de-duplicate timestamps
+# Clean and sort
+df = df[[time_col, v_col, i_col]].rename(columns={time_col: "time_s", v_col: "V_V", i_col: "I_A"}).copy()
+df = df.replace([np.inf, -np.inf], np.nan).dropna()
 df = df.sort_values("time_s")
-before = len(df)
 df = df[~df["time_s"].duplicated(keep="first")]
-after = len(df)
-if after < before:
-    st.warning(f"Removed {before-after} duplicated time rows.")
 
-# Δt inspector
-if len(df) < 3:
-    st.error("Need at least 3 time points after cleaning.")
+if len(df) < 10:
+    st.error("Not enough data points after cleaning. Need at least 10.")
     st.stop()
-dt = np.diff(df["time_s"].to_numpy())
-if np.any(dt <= 0):
-    st.warning("Found non-increasing (or zero) time steps; those segments cannot produce valid derivatives.")
-st.caption(f"Δt stats — min: {np.min(dt):.6e} s, median: {np.median(dt):.6e} s, max: {np.max(dt):.6e} s")
 
-# ============================ Derivatives per point (your formula) ============================ #
-t = df["time_s"].to_numpy().astype(float)
-V = df["V"].to_numpy().astype(float)
-I = df["I"].to_numpy().astype(float)
+# Optional smoothing
+df["V_smooth"] = moving_average(df["V_V"].to_numpy(), smooth_win)
+df["I_smooth"] = moving_average(df["I_A"].to_numpy(), smooth_win)
 
-dVdt = finite_diff(V, t, mode=scheme)
-dIdt = finite_diff(I, t, mode=scheme)
+# Derivatives
+t = df["time_s"].to_numpy()
+V = df["V_smooth"].to_numpy()
+I = df["I_smooth"].to_numpy()
+
+if method.startswith("Local"):
+    dVdt = local_linear_slope(t, V, window_sec=float(window_sec), min_points=int(min_pts))
+    dIdt = local_linear_slope(t, I, window_sec=float(window_sec), min_points=int(min_pts))
+else:
+    dVdt = safe_gradient(V, t)
+    dIdt = safe_gradient(I, t)
 
 df["dVdt_Vps"] = dVdt
 df["dIdt_Aps"] = dIdt
 
-# ============================ Thresholds ============================ #
-if thr_v_user.strip()=="" or thr_i_user.strip()=="":
+# Suggest thresholds if user left blank
+if thr_v_user.strip() == "" or thr_i_user.strip() == "":
     sv, si = suggest_thresholds(dVdt, dIdt, factor=3.0)
-    if (not np.isfinite(sv)) or (sv <= 0):
+    if np.isnan(sv) or sv <= 0:
         sv = np.nanmax([np.nanpercentile(np.abs(dVdt), 10), 1e-3])
-    if (not np.isfinite(si)) or (si <= 0):
+    if np.isnan(si) or si <= 0:
         si = np.nanmax([np.nanpercentile(np.abs(dIdt), 10), 1e-3])
-    thr_v = float(thr_v_user) if thr_v_user.strip()!="" else float(sv)
-    thr_i = float(thr_i_user) if thr_i_user.strip()!="" else float(si)
+    thr_v = float(thr_v_user) if thr_v_user.strip() != "" else float(sv)
+    thr_i = float(thr_i_user) if thr_i_user.strip() != "" else float(si)
 else:
     try:
         thr_v = float(thr_v_user)
@@ -292,86 +305,201 @@ else:
         st.error("Threshold inputs must be numeric.")
         st.stop()
 
-# ============================ QSS (IEC dwell rule) ============================ #
-qss = dwell_pass_flags(t, dVdt, dIdt, thr_v=thr_v, thr_i=thr_i, dwell_sec=float(dwell_sec))
-df["QSS_pass"] = qss
+# Pass/fail flags based on dwell (base thresholds)
+pass_flags = dwell_pass_flags(t, dVdt, dIdt, thr_v=thr_v, thr_i=thr_i, dwell_sec=float(dwell_sec), method="last_window")
+df["QSS_pass"] = pass_flags
 
-# ============================ Step detection & per-step pick ============================ #
-step_starts = detect_steps(df["V"].to_numpy(), t, min_step_V=float(min_step_V), min_step_gap=float(min_step_gap))
-picks = pick_first_qss_per_step(t, qss, step_starts, min_spacing_sec=float(min_pick_gap))
+# Step detection and recommended picks
+step_idx = detect_steps(df["V_V"].to_numpy(), min_step_V=float(min_step_V))
+picks = pick_recommended_points(t, V, I, pass_flags, step_idx, min_separation_sec=float(min_sep))
 df["Recommended"] = False
 if len(picks) > 0:
     df.loc[df.index[picks], "Recommended"] = True
 
-# ============================ Summary ============================ #
+# --------------------- Power & MPP determination (QSS-only enforced) --------------------- #
+# Power per sample from raw V and I (not smoothed)
+df["P_W"] = df["V_V"] * df["I_A"]
+
+# Candidates are ONLY the samples that pass the base QSS criterion (dwell-based).
+qss_candidates = df.index[df["QSS_pass"]]
+if len(qss_candidates) == 0:
+    st.error(
+        "No quasi-steady-state (QSS) samples found under current thresholds/dwell. "
+        "Relax thresholds or increase dwell to obtain QSS-pass data points."
+    )
+    st.stop()
+
+cand_idx = qss_candidates
+mpp_source = "QSS_pass (enforced)"
+
+# Index of the MPP row within df (max power among QSS-only candidates)
+mpp_idx = df.loc[cand_idx, "P_W"].idxmax()
+df["is_MPP"] = False
+df.at[mpp_idx, "is_MPP"] = True
+
+# Values at MPP
+Vpmax = float(df.at[mpp_idx, "V_V"])
+Ipmax = float(df.at[mpp_idx, "I_A"])
+Pmax  = float(df.at[mpp_idx, "P_W"])
+dVdt_mpp = float(df.at[mpp_idx, "dVdt_Vps"])
+dIdt_mpp = float(df.at[mpp_idx, "dIdt_Aps"])
+t_mpp = float(df.at[mpp_idx, "time_s"])
+qss_mpp = True  # by construction (picked only from QSS_pass)
+# Informative power derivative at MPP
+dPdt_mpp = Ipmax * dVdt_mpp + Vpmax * dIdt_mpp
+
+# Near‑MPP band (within near_pct% of Pmax, restricted to same QSS-only candidate set)
+near_threshold = (1.0 - near_pct / 100.0) * Pmax
+cand_df = df.loc[cand_idx].copy()
+near_df = cand_df[cand_df["P_W"] >= near_threshold].copy()
+near_df["delta_P_W"] = Pmax - near_df["P_W"]
+near_df = near_df.sort_values(["delta_P_W", "time_s"]).head(int(near_max_rows))
+
+# --------------------- Summary --------------------- #
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Samples", f"{len(df)}")
-c2.metric("QSS pass (count)", f"{int(df['QSS_pass'].sum())}")
-c3.metric("|dV/dt| ≤ [V/s]", f"{thr_v:0.5f}")
-c4.metric("|dI/dt| ≤ [A/s]", f"{thr_i:0.5f}")
+c2.metric("QSS Pass (count)", f"{int(df['QSS_pass'].sum())}")
+c3.metric("Suggested |dV/dt| ≤ [V/s]", f"{thr_v:0.5f}")
+c4.metric("Suggested |dI/dt| ≤ [A/s]", f"{thr_i:0.5f}")
 
-st.caption(
-    "Per‑point derivatives are computed by finite differences. "
-    "A sample passes QSS only if both |dV/dt| and |dI/dt| "
-    f"remain ≤ thresholds throughout the preceding dwell of {dwell_sec:.4f} s."
-)
+st.caption("QSS = Quasi-Steady-State; a sample passes if both |dV/dt| and |dI/dt| remain below thresholds for the last dwell window.")
 
-# ============================ Plots ============================ #
-st.subheader("Derivatives vs Time (with thresholds)")
-fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+# --------------------- MPP Block --------------------- #
+st.subheader("Maximum Power Point (VPmax, IPmax, and derivatives at MPP)  —  QSS-only enforced")
+mc1, mc2, mc3, mc4 = st.columns(4)
+mc1.metric("Pmax [W]", f"{Pmax:0.3f}")
+mc2.metric("Vpmax [V]", f"{Vpmax:0.3f}")
+mc3.metric("Ipmax [A]", f"{Ipmax:0.3f}")
+mc4.metric("dP/dt @MPP [W/s]", f"{dPdt_mpp:0.5f}")
 
-ax[0].plot(df["time_s"], df["dVdt_Vps"], color="#9467bd", lw=1.0, label="dV/dt")
-ax[0].axhline(+thr_v, color="#9467bd", ls="--", alpha=0.5)
-ax[0].axhline(-thr_v, color="#9467bd", ls="--", alpha=0.5)
-ax[0].set_ylabel("dV/dt [V/s]")
-ax[0].grid(True, alpha=0.3); ax[0].legend(loc="upper right")
+mc5, mc6, mc7, mc8 = st.columns(4)
+mc5.metric("dV/dt @MPP [V/s]", f"{dVdt_mpp:0.5e}")
+mc6.metric("dI/dt @MPP [A/s]", f"{dIdt_mpp:0.5e}")
+mc7.metric("QSS @MPP", "PASS ✅" if qss_mpp else "FAIL ❌")
+mc8.metric("MPP selected from", mpp_source)
 
-ax[1].plot(df["time_s"], df["dIdt_Aps"], color="#8c564b", lw=1.0, label="dI/dt")
-ax[1].axhline(+thr_i, color="#8c564b", ls="--", alpha=0.5)
-ax[1].axhline(-thr_i, color="#8c564b", ls="--", alpha=0.5)
-ax[1].set_ylabel("dI/dt [A/s]"); ax[1].set_xlabel("Time [s]")
-ax[1].grid(True, alpha=0.3); ax[1].legend(loc="upper right")
+with st.expander("Near‑MPP points (showing dV/dt & dI/dt near Pmax)", expanded=True):
+    show_cols = ["time_s", "V_V", "I_A", "P_W", "dVdt_Vps", "dIdt_Aps", "QSS_pass"]
+    st.dataframe(near_df[show_cols].reset_index(drop=True),
+                 use_container_width=True, hide_index=True)
 
-# Mark recommended picks
+# --------------------- Plots --------------------- #
+st.subheader("Time Series")
+
+fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+axs[0].plot(df["time_s"], df["V_V"], color="#1f77b4", label="V [raw]")
+axs[0].plot(df["time_s"], df["V_smooth"], color="#ff7f0e", alpha=0.8, label="V [smooth]")
+axs[0].set_ylabel("Voltage [V]")
+axs[0].legend(loc="upper right")
+axs[0].grid(True, alpha=0.3)
+
+axs[1].plot(df["time_s"], df["I_A"], color="#2ca02c", label="I [raw]")
+axs[1].plot(df["time_s"], df["I_smooth"], color="#d62728", alpha=0.8, label="I [smooth]")
+axs[1].set_ylabel("Current [A]")
+axs[1].legend(loc="upper right")
+axs[1].grid(True, alpha=0.3)
+
+axs[2].plot(df["time_s"], df["dVdt_Vps"], color="#9467bd", label="dV/dt")
+axs[2].plot(df["time_s"], df["dIdt_Aps"], color="#8c564b", label="dI/dt")
+axs[2].axhline(+thr_v, color="#9467bd", linestyle="--", alpha=0.5)
+axs[2].axhline(-thr_v, color="#9467bd", linestyle="--", alpha=0.5)
+axs[2].axhline(+thr_i, color="#8c564b", linestyle="--", alpha=0.5)
+axs[2].axhline(-thr_i, color="#8c564b", linestyle="--", alpha=0.5)
+axs[2].set_ylabel("Derivatives [V/s, A/s]")
+axs[2].set_xlabel("Time [s]")
+axs[2].legend(loc="upper right")
+axs[2].grid(True, alpha=0.3)
+
+# Mark recommended points (x)
 if len(picks) > 0:
-    ax[0].scatter(df["time_s"].iloc[picks], df["dVdt_Vps"].iloc[picks], color="k", s=35, marker="x", zorder=5)
-    ax[1].scatter(df["time_s"].iloc[picks], df["dIdt_Aps"].iloc[picks], color="k", s=35, marker="x", zorder=5)
+    axs[0].scatter(df["time_s"].iloc[picks], df["V_smooth"].iloc[picks], color="k", marker="x", s=40, label="Recommended")
+    axs[1].scatter(df["time_s"].iloc[picks], df["I_smooth"].iloc[picks], color="k", marker="x", s=40)
+    axs[2].scatter(df["time_s"].iloc[picks], df["dVdt_Vps"].iloc[picks], color="k", marker="x", s=40)
+    axs[2].scatter(df["time_s"].iloc[picks], df["dIdt_Aps"].iloc[picks], color="k", marker="x", s=40)
+
+# Highlight MPP (vertical line on all, star markers)
+for ax in axs:
+    ax.axvline(t_mpp, color="red", linestyle=":", alpha=0.6)
+axs[0].scatter([t_mpp], [Vpmax], color="red", s=60, marker="*", zorder=5, label="MPP")
+axs[1].scatter([t_mpp], [Ipmax], color="red", s=60, marker="*", zorder=5)
+axs[2].scatter([t_mpp], [dVdt_mpp], color="red", s=60, marker="*", zorder=5)
+axs[2].scatter([t_mpp], [dIdt_mpp], color="red", s=60, marker="*", zorder=5)
 
 st.pyplot(fig, use_container_width=True)
 
-st.subheader("IV with QSS status")
+# IV scatter with pass/fail
+st.subheader("IV Curve with QSS Status")
 fig2, ax2 = plt.subplots(1, 1, figsize=(6, 5))
-mask = df["QSS_pass"].to_numpy()
-ax2.scatter(df["V"][~mask], df["I"][~mask], s=10, color="#ff9896", label="Not QSS")
-ax2.scatter(df["V"][mask],  df["I"][mask],  s=10, color="#98df8a", label="QSS pass")
+mask_pass = df["QSS_pass"].to_numpy()
+ax2.scatter(df["V_V"][~mask_pass], df["I_A"][~mask_pass], s=12, color="#ff9896", label="Not QSS")
+ax2.scatter(df["V_V"][mask_pass], df["I_A"][mask_pass], s=12, color="#98df8a", label="QSS pass")
 if len(picks) > 0:
-    ax2.scatter(df["V"].iloc[picks], df["I"].iloc[picks], s=45, color="k", marker="x", label="Recommended")
-ax2.set_xlabel("Voltage [V]"); ax2.set_ylabel("Current [A]")
-ax2.grid(True, alpha=0.3); ax2.legend(loc="best")
+    ax2.scatter(df["V_V"].iloc[picks], df["I_A"].iloc[picks], s=45, color="k", marker="x", label="Recommended")
+# MPP star
+ax2.scatter([Vpmax], [Ipmax], s=80, color="red", marker="*", label="MPP")
+# Near‑MPP points (small gray markers), restricted to QSS-only candidates
+if len(near_df) > 0:
+    ax2.scatter(near_df["V_V"], near_df["I_A"], s=18, color="gray", alpha=0.6, label=f"Near‑MPP (≥{100-near_pct:.1f}% Pmax)")
+ax2.set_xlabel("Voltage [V]")
+ax2.set_ylabel("Current [A]")
+ax2.grid(True, alpha=0.3)
+ax2.legend(loc="best")
 st.pyplot(fig2, use_container_width=True)
 
-# ============================ Table & Export ============================ #
-st.subheader("Per‑sample results")
-show_cols = ["time_s","V","I","P","dVdt_Vps","dIdt_Aps","QSS_pass","Recommended"]
-st.dataframe(df[show_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+# --------------------- Recommended points table --------------------- #
+st.subheader("Recommended Measurement Points (per step)")
+if len(picks) > 0:
+    out_cols = ["time_s", "V_V", "I_A", "P_W", "dVdt_Vps", "dIdt_Aps", "QSS_pass", "Recommended", "is_MPP"]
+    table = df.iloc[picks][out_cols].reset_index(drop=True)
+    st.dataframe(table, use_container_width=True, hide_index=True)
+else:
+    st.info("No recommended points found under the current thresholds/dwell time. Consider relaxing thresholds or increasing dwell.")
 
+# --------------------- Export --------------------- #
 if want_export:
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="dvdt_didt_qss_table.csv", mime="text/csv")
+    # Full QC export
+    export_cols = ["time_s", "V_V", "I_A", "P_W", "V_smooth", "I_smooth",
+                   "dVdt_Vps", "dIdt_Aps", "QSS_pass", "Recommended", "is_MPP"]
+    export_df = df[export_cols].copy()
+    export_df.attrs["notes"] = (
+        f"Method={method}, window_sec={window_sec}, min_points={min_pts}, "
+        f"smooth_win={smooth_win}, dwell_sec={dwell_sec}, thr_v={thr_v}, thr_i={thr_i}, "
+        f"min_step_V={min_step_V}, MPP_source={mpp_source}, near_pct={near_pct}"
+    )
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download QC Report (CSV)",
+        data=csv_bytes,
+        file_name="qss_dvdt_didt_report.csv",
+        mime="text/csv"
+    )
 
-# ============================ IEC Notes ============================ #
-with st.expander("IEC 60904‑1:2020 – How this calculation validates QSS", expanded=False):
-    st.markdown("""
-**Practical interpretation of the standard**  
-- Ideal steady‑state is **dV/dt = 0** and **dI/dt = 0** (capacitive current vanishes: **dQ/dt = 0**).  
-- In practice, exact zero is unattainable → accept **quasi‑steady‑state (QSS)** when **both derivatives are sufficiently small** over a short **time interval** before acquisition.
+    # Near‑MPP export
+    if len(near_df) > 0:
+        near_cols = ["time_s", "V_V", "I_A", "P_W", "dVdt_Vps", "dIdt_Aps", "QSS_pass", "delta_P_W"]
+        near_csv = near_df[near_cols].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"⬇️ Download Near‑MPP Table (≥{100-near_pct:.1f}% Pmax)",
+            data=near_csv,
+            file_name="near_mpp_points.csv",
+            mime="text/csv"
+        )
 
-**What this app enforces**  
-- Computes **per‑point** derivatives with your finite‑difference formula (Backward/Central/Forward).  
-- Applies a **dwell‑based** QSS rule: a sample passes **only if** both |dV/dt| and |dI/dt| stay **below thresholds** for the **entire dwell** immediately preceding that sample.  
-- Detects steps and marks the **first QSS‑pass** per step—the operational equivalent of *“waiting sufficiently long”* for transients to decay.  
-- Thresholds are **data‑driven** (robust noise‑based suggestion) with **manual override** for your lab‑validated limits.
+# --------------------- Guidance --------------------- #
+with st.expander("Notes & Guidance", expanded=False):
+    st.markdown(
+        """
+**What this app does**
 
-**Evidence produced**  
-- Per‑sample table with **dV/dt**, **dI/dt**, **QSS_pass**, **Recommended**; derivative plots with thresholds; IV plot with QSS coloring.
-""")
+- Computes **dV/dt** and **dI/dt** per sample from time-series IV acquisition.
+- Applies a **quasi-steady-state (QSS)** check using dwell-based derivative thresholds.
+- Detects steps and proposes the **first QSS-compliant** point per step as **Recommended**.
+- Computes **power** per sample (**P = V×I**) and determines **Pmax**.
+- **QSS-only enforced:** MPP and near‑MPP are selected **only** from **QSS-pass** samples.
+
+**Tips**
+
+- Use the **Local linear** derivative estimator; set the window a bit **shorter than dwell**.
+- For high‑capacitance modules, consider larger dwell or tighter thresholds; **dP/dt at MPP** should be **very small** if QSS is satisfied.
+        """
+    ) redifine dV/dt  & dI/dt of each point
