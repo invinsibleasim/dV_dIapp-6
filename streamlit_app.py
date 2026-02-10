@@ -1,3 +1,5 @@
+# streamlit_app.py
+# Formula-based dV/dt & dI/dt per point with IEC 60904-1:2020 QSS enforcement
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,17 +11,19 @@ st.set_page_config(
     page_icon="⚡"
 )
 
-# ---------------- Utilities ---------------- #
+# ============================ Utilities ============================ #
 def robust_mad(x):
+    """Return (median, 1.4826*MAD) as a robust σ estimate."""
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     if x.size == 0:
         return np.nan, np.nan
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
-    return med, 1.4826 * mad  # ≈ robust σ
+    return med, 1.4826 * mad
 
 def suggest_thresholds(dVdt, dIdt, factor=3.0):
+    """Auto-suggest derivative thresholds from noise floor (MAD-based)."""
     _, sig_v = robust_mad(dVdt[np.isfinite(dVdt)])
     _, sig_i = robust_mad(dIdt[np.isfinite(dIdt)])
     thr_v = factor * sig_v if (np.isfinite(sig_v) and sig_v > 0) else np.nan
@@ -28,12 +32,13 @@ def suggest_thresholds(dVdt, dIdt, factor=3.0):
 
 def finite_diff(y, t, mode="backward"):
     """
-    Formula-based dy/dt per point.
+    Formula-based dy/dt per point with irregular t support.
     mode:
-      - 'backward': dy/dt[i] = (y[i]-y[i-1])/(t[i]-t[i-1]); dy/dt[0]=NaN
-      - 'forward' : dy/dt[i] = (y[i+1]-y[i])/(t[i+1]-t[i]); dy/dt[-1]=NaN
-      - 'central' : dy/dt[i] = (y[i+1]-y[i-1])/(t[i+1]-t[i-1]) for 1..n-2; ends backward/forward
-    Handles irregular t and avoids divide-by-zero (returns NaN there).
+      - 'backward': dy/dt[i] = (y[i]-y[i-1])/(t[i]-t[i-1]); dy/dt[0] = NaN
+      - 'forward' : dy/dt[i] = (y[i+1]-y[i])/(t[i+1]-t[i]); dy/dt[-1] = NaN
+      - 'central' : dy/dt[i] = (y[i+1]-y[i-1])/(t[i+1]-t[i-1]) for 1..n-2;
+                    ends use backward/forward
+    NaN where Δt == 0 (division by zero avoided).
     """
     y = np.asarray(y, float)
     t = np.asarray(t, float)
@@ -46,109 +51,110 @@ def finite_diff(y, t, mode="backward"):
     if mode == "backward":
         dt = t[1:] - t[:-1]
         dy = y[1:] - y[:-1]
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             out[1:] = np.where(dt != 0, dy / dt, np.nan)
-        # out[0] = NaN
+
     elif mode == "forward":
         dt = t[1:] - t[:-1]
         dy = y[1:] - y[:-1]
-        with np.errstate(divide='ignore', invalid='ignore'):
+        with np.errstate(divide="ignore", invalid="ignore"):
             out[:-1] = np.where(dt != 0, dy / dt, np.nan)
-        # out[-1] = NaN
+
     else:  # central
         if n >= 3:
             dtc = t[2:] - t[:-2]
             dyc = y[2:] - y[:-2]
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with np.errstate(divide="ignore", invalid="ignore"):
                 out[1:-1] = np.where(dtc != 0, dyc / dtc, np.nan)
-        # End points fallback to backward/forward
-        # backward for index 1; forward for index n-2 not necessary; do both ends explicitly:
-        if n >= 2:
-            # backward at index 1 uses [1]-[0]
-            dtb = t[1] - t[0]
-            out[0] = (y[1] - y[0]) / dtb if dtb != 0 else np.nan
-            # forward at index n-2 uses [n-1]-[n-2]
-            dtf = t[-1] - t[-2]
-            out[-1] = (y[-1] - y[-2]) / dtf if dtf != 0 else np.nan
+        # end-point fallbacks:
+        dt0 = t[1] - t[0]
+        out[0] = (y[1] - y[0]) / dt0 if dt0 != 0 else np.nan
+        dtn = t[-1] - t[-2]
+        out[-1] = (y[-1] - y[-2]) / dtn if dtn != 0 else np.nan
 
     return out
 
 def dwell_pass_flags(t, dVdt, dIdt, thr_v, thr_i, dwell_sec):
     """
-    IEC QSS rule: For each i, both |dV/dt| and |dI/dt| must remain
-    <= thresholds throughout [t[i]-dwell_sec, t[i]].
+    IEC QSS rule:
+    For each sample i, both |dV/dt| and |dI/dt| must remain <= thresholds
+    throughout the interval [t[i]-dwell_sec, t[i]].
     """
     t = np.asarray(t, float)
     dv = np.asarray(dVdt, float)
     di = np.asarray(dIdt, float)
     n = len(t)
     out = np.zeros(n, dtype=bool)
-
     for i in range(n):
         L = np.searchsorted(t, t[i] - dwell_sec, side="left")
         R = i + 1
-        if R - L >= 2:  # need at least two points to qualify a window
+        if R - L >= 2:  # need at least two points in dwell
             ok_v = np.nanmax(np.abs(dv[L:R])) <= thr_v
             ok_i = np.nanmax(np.abs(di[L:R])) <= thr_i
             out[i] = bool(ok_v and ok_i)
     return out
 
 def detect_steps(V, t, min_step_V=0.25, min_step_gap=0.01):
+    """
+    Step detection by |ΔV|, ensuring minimal time between step starts.
+    Always include index 0 as the first step.
+    """
     V = np.asarray(V, float)
     t = np.asarray(t, float)
     dv = np.diff(V, prepend=V[0])
     cand = np.where(np.abs(dv) >= float(min_step_V))[0]
     steps = [0]
-    last_t = t[0]
+    last = t[0] if len(t) else 0.0
     for idx in cand:
-        if t[idx] - last_t >= float(min_step_gap):
+        if t[idx] - last >= float(min_step_gap):
             steps.append(int(idx))
-            last_t = t[idx]
+            last = t[idx]
     return np.unique(np.array(steps, dtype=int))
 
 def pick_first_qss_per_step(t, qss_flags, step_starts, min_spacing_sec=0.0):
+    """For each step start, pick FIRST index at/after start where QSS is True, with minimal time spacing enforced."""
     t = np.asarray(t, float)
-    n = len(t)
-    picks = []
-    last = -np.inf
+    picks, last_t = [], -np.inf
     for s in step_starts:
         i = int(s)
-        while i < n:
-            if qss_flags[i] and (t[i] - last >= min_spacing_sec):
-                picks.append(i); last = t[i]; break
+        while i < len(t):
+            if qss_flags[i] and (t[i] - last_t >= min_spacing_sec):
+                picks.append(i)
+                last_t = t[i]
+                break
             i += 1
     return np.array(picks, dtype=int)
 
-# ---------------- Sidebar ---------------- #
+# ============================ Sidebar ============================ #
 st.sidebar.header("Configuration")
 
 st.sidebar.subheader("Data Input")
 uploaded = st.sidebar.file_uploader("Upload CSV (tab/comma) or Excel", type=["csv", "xlsx"])
-demo = st.sidebar.toggle("Use demo table like yours", value=(uploaded is None))
+demo = st.sidebar.toggle("Use a small demo snippet (if no file uploaded)", value=(uploaded is None))
 
-st.sidebar.subheader("Columns & Units")
-# Expected defaults as per your table
-time_default = "TimeOffset"
-v_default    = "Vraw"
-i_default    = "Iraw"
-p_default    = "Praw"
+st.sidebar.subheader("Column Mapping")
+time_default = "TimeOffset"  # your table header
+v_default    = "Vraw"        # your table header
+i_default    = "Iraw"        # your table header
+p_default    = "Praw"        # optional
 
 st.sidebar.subheader("Derivative Scheme")
-scheme = st.sidebar.selectbox(
-    "Finite difference scheme",
-    ["Backward (V_i-V_{i-1})/Δt", "Central (V_{i+1}-V_{i-1})/Δt", "Forward (V_{i+1}-V_i)/Δt"],
+scheme_label = st.sidebar.selectbox(
+    "Finite difference formula",
+    ["Backward (V[i]-V[i-1])/Δt", "Central (V[i+1]-V[i-1])/Δt", "Forward (V[i+1]-V[i])/Δt"],
     index=0
 )
 scheme_map = {
-    "Backward (V_i-V_{i-1})/Δt": "backward",
-    "Central (V_{i+1}-V_{i-1})/Δt": "central",
-    "Forward (V_{i+1}-V_i)/Δt": "forward",
+    "Backward (V[i]-V[i-1])/Δt": "backward",
+    "Central (V[i+1]-V[i-1])/Δt": "central",
+    "Forward (V[i+1]-V[i])/Δt": "forward",
 }
+scheme = scheme_map[scheme_label]
 
 st.sidebar.subheader("QSS (IEC 60904-1:2020)")
-dwell_sec = st.sidebar.number_input("Dwell time [s] (window before each point)", min_value=0.0001, max_value=1.0, value=0.0020, step=0.0001, format="%.4f")
-thr_v_user = st.sidebar.text_input("Max |dV/dt| [V/s] (blank = auto)", value="")
-thr_i_user = st.sidebar.text_input("Max |dI/dt| [A/s] (blank = auto)", value="")
+dwell_sec = st.sidebar.number_input("Dwell time [s] (look-back window)", min_value=0.0001, max_value=2.0, value=0.0020, step=0.0001, format="%.4f")
+thr_v_user = st.sidebar.text_input("Max |dV/dt| [V/s] (leave blank = auto)", value="")
+thr_i_user = st.sidebar.text_input("Max |dI/dt| [A/s] (leave blank = auto)", value="")
 
 st.sidebar.subheader("Step Detection")
 min_step_V  = st.sidebar.number_input("Min step size [V]", min_value=0.001, max_value=10.0, value=0.25, step=0.001)
@@ -157,10 +163,9 @@ min_pick_gap = st.sidebar.number_input("Min spacing between picked points [s]", 
 
 want_export = st.sidebar.toggle("Enable CSV export", value=True)
 
-# ---------------- Load Data ---------------- #
+# ============================ Load Data ============================ #
 if demo:
-    # Build a small DataFrame from your pasted structure
-    sample = """TimeOffset\tVimp\tIraw\tVraw\tPraw\tdV/dt\tdI/dt
+    demo_text = """TimeOffset\tVimp\tIraw\tVraw\tPraw\tdV/dt\tdI/dt
 0\t-0.81\t11.6009\t7.2096\t83.63784864\t-949\t-806
 0.0001\t-2.7\t12.4615\t5.5231\t68.82611065\t-527\t-275
 0.0002\t-4.41\t12.9625\t4.0053\t51.91870125\t-1054\t-177
@@ -193,14 +198,14 @@ if demo:
 0.0029\t33.869\t12.9173\t41.5921\t537.2576333\t-106\t59
 """
     from io import StringIO
-    df = pd.read_csv(StringIO(sample), sep="\t")
+    df = pd.read_csv(StringIO(demo_text), sep="\t")
 else:
     if uploaded is None:
         st.info("Upload a file or enable demo.")
         st.stop()
     try:
         if uploaded.name.lower().endswith(".csv"):
-            # try auto-sep
+            # auto-detect separator
             try:
                 df = pd.read_csv(uploaded, sep=None, engine="python")
             except Exception:
@@ -211,7 +216,7 @@ else:
         st.error(f"Failed to load file: {e}")
         st.stop()
 
-# Column mapping
+# ============================ Column Mapping (FIXED) ============================ #
 with st.expander("Map columns", expanded=True):
     cols = list(df.columns)
     time_col = st.selectbox("Time column [s]", cols, index=cols.index(time_default) if time_default in cols else 0)
@@ -219,32 +224,58 @@ with st.expander("Map columns", expanded=True):
     i_col    = st.selectbox("Current column [A]", cols, index=cols.index(i_default) if i_default in cols else 2)
     p_col    = st.selectbox("Power column [W] (optional)", ["<none>"] + cols, index=(cols.index(p_default)+1 if p_default in cols else 0))
 
-# Clean & sort
-df = df[[time_col, v_col, i_col] + ([p_col] if p_col != "<none>" else [])].copy()
-df = df.rename(columns={time_col:"time_s", v_col:"V", i_col:"I", (p_col if p_col!="<none>" else "time_s"):"P"}).copy()
+# Build selection list
+select_cols = [time_col, v_col, i_col] + ([p_col] if p_col != "<none>" else [])
+df = df[select_cols].copy()
+
+# Safe renaming (DO NOT touch time unless mapping)
+rename_map = {time_col: "time_s", v_col: "V", i_col: "I"}
+if p_col != "<none>":
+    rename_map[p_col] = "P"
+df = df.rename(columns=rename_map).copy()
+
+# Coerce numerics robustly
+for c in ["time_s", "V", "I"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+if p_col != "<none>":
+    df["P"] = pd.to_numeric(df["P"], errors="coerce")
+
+# Drop non-numeric rows in required columns
+df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["time_s", "V", "I"])
 if p_col == "<none>":
     df["P"] = df["V"] * df["I"]
+else:
+    df = df.dropna(subset=["P"])
 
-df = df.replace([np.inf, -np.inf], np.nan).dropna()
+# Enforce strictly increasing time & de-duplicate timestamps
 df = df.sort_values("time_s")
+before = len(df)
 df = df[~df["time_s"].duplicated(keep="first")]
-if len(df) < 3:
-    st.error("Need at least 3 points after cleaning.")
-    st.stop()
+after = len(df)
+if after < before:
+    st.warning(f"Removed {before-after} duplicated time rows.")
 
-# ---------------- Derivatives by your formula ---------------- #
-mode = scheme_map[scheme]
+# Δt inspector
+if len(df) < 3:
+    st.error("Need at least 3 time points after cleaning.")
+    st.stop()
+dt = np.diff(df["time_s"].to_numpy())
+if np.any(dt <= 0):
+    st.warning("Found non-increasing (or zero) time steps; those segments cannot produce valid derivatives.")
+st.caption(f"Δt stats — min: {np.min(dt):.6e} s, median: {np.median(dt):.6e} s, max: {np.max(dt):.6e} s")
+
+# ============================ Derivatives per point (your formula) ============================ #
 t = df["time_s"].to_numpy().astype(float)
 V = df["V"].to_numpy().astype(float)
 I = df["I"].to_numpy().astype(float)
 
-dVdt = finite_diff(V, t, mode=mode)
-dIdt = finite_diff(I, t, mode=mode)
+dVdt = finite_diff(V, t, mode=scheme)
+dIdt = finite_diff(I, t, mode=scheme)
 
 df["dVdt_Vps"] = dVdt
 df["dIdt_Aps"] = dIdt
 
-# ---------------- Thresholds ---------------- #
+# ============================ Thresholds ============================ #
 if thr_v_user.strip()=="" or thr_i_user.strip()=="":
     sv, si = suggest_thresholds(dVdt, dIdt, factor=3.0)
     if (not np.isfinite(sv)) or (sv <= 0):
@@ -261,18 +292,18 @@ else:
         st.error("Threshold inputs must be numeric.")
         st.stop()
 
-# ---------------- QSS (IEC dwell rule) ---------------- #
+# ============================ QSS (IEC dwell rule) ============================ #
 qss = dwell_pass_flags(t, dVdt, dIdt, thr_v=thr_v, thr_i=thr_i, dwell_sec=float(dwell_sec))
 df["QSS_pass"] = qss
 
-# ---------------- Step detection & per-step pick ---------------- #
+# ============================ Step detection & per-step pick ============================ #
 step_starts = detect_steps(df["V"].to_numpy(), t, min_step_V=float(min_step_V), min_step_gap=float(min_step_gap))
 picks = pick_first_qss_per_step(t, qss, step_starts, min_spacing_sec=float(min_pick_gap))
 df["Recommended"] = False
 if len(picks) > 0:
     df.loc[df.index[picks], "Recommended"] = True
 
-# ---------------- Summary ---------------- #
+# ============================ Summary ============================ #
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Samples", f"{len(df)}")
 c2.metric("QSS pass (count)", f"{int(df['QSS_pass'].sum())}")
@@ -282,16 +313,18 @@ c4.metric("|dI/dt| ≤ [A/s]", f"{thr_i:0.5f}")
 st.caption(
     "Per‑point derivatives are computed by finite differences. "
     "A sample passes QSS only if both |dV/dt| and |dI/dt| "
-    f"stay within thresholds throughout the preceding dwell of {dwell_sec:.4f} s."
+    f"remain ≤ thresholds throughout the preceding dwell of {dwell_sec:.4f} s."
 )
 
-# ---------------- Plots ---------------- #
-st.subheader("Derivatives vs Time")
-fig, ax = plt.subplots(2,1, figsize=(10,6), sharex=True)
+# ============================ Plots ============================ #
+st.subheader("Derivatives vs Time (with thresholds)")
+fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
 ax[0].plot(df["time_s"], df["dVdt_Vps"], color="#9467bd", lw=1.0, label="dV/dt")
 ax[0].axhline(+thr_v, color="#9467bd", ls="--", alpha=0.5)
 ax[0].axhline(-thr_v, color="#9467bd", ls="--", alpha=0.5)
-ax[0].set_ylabel("dV/dt [V/s]"); ax[0].grid(True, alpha=0.3); ax[0].legend(loc="upper right")
+ax[0].set_ylabel("dV/dt [V/s]")
+ax[0].grid(True, alpha=0.3); ax[0].legend(loc="upper right")
 
 ax[1].plot(df["time_s"], df["dIdt_Aps"], color="#8c564b", lw=1.0, label="dI/dt")
 ax[1].axhline(+thr_i, color="#8c564b", ls="--", alpha=0.5)
@@ -299,15 +332,15 @@ ax[1].axhline(-thr_i, color="#8c564b", ls="--", alpha=0.5)
 ax[1].set_ylabel("dI/dt [A/s]"); ax[1].set_xlabel("Time [s]")
 ax[1].grid(True, alpha=0.3); ax[1].legend(loc="upper right")
 
-# Mark picks
+# Mark recommended picks
 if len(picks) > 0:
-    ax[0].scatter(df["time_s"].iloc[picks], df["dVdt_Vps"].iloc[picks], color="k", s=35, marker="x")
-    ax[1].scatter(df["time_s"].iloc[picks], df["dIdt_Aps"].iloc[picks], color="k", s=35, marker="x")
+    ax[0].scatter(df["time_s"].iloc[picks], df["dVdt_Vps"].iloc[picks], color="k", s=35, marker="x", zorder=5)
+    ax[1].scatter(df["time_s"].iloc[picks], df["dIdt_Aps"].iloc[picks], color="k", s=35, marker="x", zorder=5)
 
 st.pyplot(fig, use_container_width=True)
 
-st.subheader("IV with QSS Status")
-fig2, ax2 = plt.subplots(1,1, figsize=(6,5))
+st.subheader("IV with QSS status")
+fig2, ax2 = plt.subplots(1, 1, figsize=(6, 5))
 mask = df["QSS_pass"].to_numpy()
 ax2.scatter(df["V"][~mask], df["I"][~mask], s=10, color="#ff9896", label="Not QSS")
 ax2.scatter(df["V"][mask],  df["I"][mask],  s=10, color="#98df8a", label="QSS pass")
@@ -317,7 +350,7 @@ ax2.set_xlabel("Voltage [V]"); ax2.set_ylabel("Current [A]")
 ax2.grid(True, alpha=0.3); ax2.legend(loc="best")
 st.pyplot(fig2, use_container_width=True)
 
-# ---------------- Table & Export ---------------- #
+# ============================ Table & Export ============================ #
 st.subheader("Per‑sample results")
 show_cols = ["time_s","V","I","P","dVdt_Vps","dIdt_Aps","QSS_pass","Recommended"]
 st.dataframe(df[show_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
@@ -326,19 +359,19 @@ if want_export:
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="dvdt_didt_qss_table.csv", mime="text/csv")
 
-# ---------------- IEC Notes ---------------- #
-with st.expander("IEC 60904‑1:2020 – How this calculation validates the QSS requirement", expanded=False):
+# ============================ IEC Notes ============================ #
+with st.expander("IEC 60904‑1:2020 – How this calculation validates QSS", expanded=False):
     st.markdown("""
-**What the standard requires (practical):**
-- Ideal steady‑state: **dV/dt = 0** and **dI/dt = 0** (capacitive current vanishes, i.e., **dQ/dt = 0**).
-- In practice you cannot reach exact zero → **quasi‑steady‑state (QSS)**: both derivatives must be **sufficiently small** for a **time interval** before acquisition.
+**Practical interpretation of the standard**  
+- Ideal steady‑state is **dV/dt = 0** and **dI/dt = 0** (capacitive current vanishes: **dQ/dt = 0**).  
+- In practice, exact zero is unattainable → accept **quasi‑steady‑state (QSS)** when **both derivatives are sufficiently small** over a short **time interval** before acquisition.
 
-**How this app enforces it:**
-- Computes **per‑point derivatives** using your formula (finite differences).
-- Uses a **dwell window** and requires **both |dV/dt| and |dI/dt| to remain below thresholds throughout the dwell** (not just at a single instant).
-- Detects step changes in voltage and picks the **first QSS‑pass point** after each step, ensuring we **wait sufficiently long**.
-- Thresholds are **data‑driven** (robust noise‑based) and can be **tightened** to your lab’s validated values.
+**What this app enforces**  
+- Computes **per‑point** derivatives with your finite‑difference formula (Backward/Central/Forward).  
+- Applies a **dwell‑based** QSS rule: a sample passes **only if** both |dV/dt| and |dI/dt| stay **below thresholds** for the **entire dwell** immediately preceding that sample.  
+- Detects steps and marks the **first QSS‑pass** per step—the operational equivalent of *“waiting sufficiently long”* for transients to decay.  
+- Thresholds are **data‑driven** (robust noise‑based suggestion) with **manual override** for your lab‑validated limits.
 
-**Evidence produced:**
-- Per‑row table of V, I, P, **dV/dt**, **dI/dt**, **QSS_pass**, and **Recommended** flags, plus time‑series plots with thresholds and picks.
+**Evidence produced**  
+- Per‑sample table with **dV/dt**, **dI/dt**, **QSS_pass**, **Recommended**; derivative plots with thresholds; IV plot with QSS coloring.
 """)
