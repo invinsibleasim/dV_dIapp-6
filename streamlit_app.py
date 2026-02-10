@@ -502,4 +502,4 @@ with st.expander("Notes & Guidance", expanded=False):
 - Use the **Local linear** derivative estimator; set the window a bit **shorter than dwell**.
 - For high‑capacitance modules, consider larger dwell or tighter thresholds; **dP/dt at MPP** should be **very small** if QSS is satisfied.
         """
-    ) redifine dV/dt  & dI/dt of each point
+    )
